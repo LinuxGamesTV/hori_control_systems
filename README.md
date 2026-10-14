@@ -1,7 +1,7 @@
 # This is a Experimental Linux Kernel driver (for kernels 6.12 or higher) for the Hori Truck Control System.
 
 All three pedals work now: Gas, brake and clutch.
-Force Feedback is not working yet.
+Force Feedback works now: constant force and centering spring, implemented through the reverse engineered vendor protocol (see the protocol notes in `hid-hori.c`). Games using SDL might need the environment variable `SDL_JOYSTICK_WHEEL_DEVICES=0x0f0d/0x017a` to recognize the wheel.
 
 Button 5 cannot be used as return or left mouse button, because the button is not mappable as left mouse button/return key.
 The steering wheel behaves the same as under Windows. The left analog stick can now be used as a mouse.
