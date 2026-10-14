@@ -469,14 +469,14 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {
 	u8 hat = data[1] & 0x0f;
 
-	input_report_abs(input_dev, ABS_X, data[14] << 8);
-	input_report_abs(input_dev, ABS_Y, data[12] << 8);
-	input_report_abs(input_dev, ABS_WHEEL, data[10]  << 8);
-	input_report_abs(input_dev, ABS_RX, data[16] << 8);
-	input_report_abs(input_dev, ABS_RY, data[18] << 8);
-	input_report_abs(input_dev, ABS_CLUTCH, data[20] << 8);
-	input_report_abs(input_dev, ABS_GAS, data[22] << 8);
-	input_report_abs(input_dev, ABS_BRAKE, data[24]  << 8);
+	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[13]));
+	input_report_abs(input_dev, ABS_Y, get_unaligned_le16(&data[11]));
+	input_report_abs(input_dev, ABS_WHEEL, get_unaligned_le16(&data[9]));
+	input_report_abs(input_dev, ABS_RX, get_unaligned_le16(&data[15]));
+	input_report_abs(input_dev, ABS_RY, get_unaligned_le16(&data[17]));
+	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
+	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
+	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
 
 	/* Hat is always the upper nibble of the penultimate byte of the report. This hatswitch is very tricky */
 	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][2]);
@@ -531,14 +531,14 @@ static int hori_input_configured(struct hid_device *hdev,
 	set_bit(ABS_HAT0Y, input_dev->absbit);
 	set_bit(ABS_MISC, input_dev->absbit);
 
-	input_set_abs_params(input_dev, ABS_X, 0, 65535, 255, 0);
-	input_set_abs_params(input_dev, ABS_Y, 0, 65535, 255, 0);
-	input_set_abs_params(input_dev, ABS_WHEEL, 0, 65535, 255, 0);
-	input_set_abs_params(input_dev, ABS_RX, 0, 65535, 255, 0);
-	input_set_abs_params(input_dev, ABS_RY, 0, 65535, 255, 0);
-	input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 255, 0);
-	input_set_abs_params(input_dev, ABS_GAS, 0, 65535, 255, 0);
-	input_set_abs_params(input_dev, ABS_BRAKE, 0, 65535, 255, 0);
+	input_set_abs_params(input_dev, ABS_X, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_Y, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_WHEEL, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_RX, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_RY, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_GAS, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_BRAKE, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_HAT0X, -1, 1, 0, 0);
 	input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
 	input_set_abs_params(input_dev, ABS_MISC, 0, 255, 255, 0);
