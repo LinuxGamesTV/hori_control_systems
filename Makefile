@@ -25,4 +25,4 @@ load: unload
 	insmod hid-hori.ko
 
 udev-rules:
-	install -m 0644 udev/99-hori-wheels.rules /etc/udev/rules.d/
+	install -m 0644 udev/99-hori-wheel.rules /etc/udev/rules.d/

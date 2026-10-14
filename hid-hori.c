@@ -7,13 +7,18 @@
 
 #include <linux/bits.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/hid.h>
+#include <linux/input.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/random.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 #include <linux/usb.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include <linux/unaligned.h>
 
@@ -25,6 +30,66 @@
 
 #define ABS_CLUTCH      ABS_RZ
 #define JOY_RANGE	(BTN_DEAD - BTN_JOYSTICK + 1)
+
+/*
+ * Force feedback protocol (reverse engineered from USB captures)
+ *
+ * FFB commands are 32 byte vendor output reports (report id 0x20) sent to
+ * the interrupt OUT endpoint (EP 2):
+ *
+ *   20 01 <sub> <args>		configuration commands
+ *   20 02 10 <mode> <force16> 00 00 <u32 10000> <u32 10000>
+ *				effect state, mode:
+ *				0x10 = reset (once at init)
+ *				0x00 = all effects off (wheel moves freely)
+ *				0x80 = centering spring (wheel returns to center)
+ *				0x40 = constant force, force16 signed LE
+ *					(full scale assumed +-10000)
+ *
+ * Config subcommands seen in captures: 0x03 01 (init), 0x01 <0|1> (0 while
+ * effects are driven), 0x02 <0|1> (1 enables effect updates) and
+ * 0x05 00 08 07 (sent with every effect update, 0x0708 = 1800).
+ *
+ * The device acks every command on the interrupt IN endpoint with the
+ * command byte | 0x80, e.g. 20 81 02 01 acks 20 01 02 01.
+ */
+#define HORI_FFB_REPORT_ID	0x20
+#define HORI_FFB_REPORT_LEN	32
+#define HORI_FFB_MAX_EFFECTS	16
+#define HORI_FFB_FORCE_MAX	10000
+#define HORI_FFB_TICK_MS	8
+
+#define HORI_FFB_MODE_OFF	0x00
+#define HORI_FFB_MODE_RESET	0x10
+#define HORI_FFB_MODE_FORCE	0x40
+#define HORI_FFB_MODE_SPRING	0x80
+
+struct hori_ff_effect {
+	bool active;
+	u8 type;
+	s16 level;
+	u16 direction;
+	u16 length;
+	unsigned long start;
+};
+
+struct hori_device {
+	struct hid_device *hdev;
+	struct input_dev *input;
+	struct delayed_work ff_work;
+	spinlock_t lock;
+	u8 mode;
+	u16 gain;
+	u16 autocenter;
+	bool stopping;
+	u8 outbuf[HORI_FFB_REPORT_LEN];
+	struct hori_ff_effect effects[HORI_FFB_MAX_EFFECTS];
+};
+
+static struct hori_device *hori_from_input(struct input_dev *dev)
+{
+	return hid_get_drvdata(input_get_drvdata(dev));
+}
 
 /* Fixed report descriptors for HORI FFB Truck Control Systems
  * wheel controllers
@@ -189,6 +254,217 @@ static const __u8 *hori_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 	return rdesc;
 }
 
+static const u8 hori_ff_init_a[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x03, 0x01 };
+static const u8 hori_ff_init_b[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x01, 0x01 };
+static const u8 hori_ff_init_c[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x02, 0x00 };
+static const u8 hori_ff_enable[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x02, 0x01 };
+static const u8 hori_ff_params[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x05, 0x00, 0x08, 0x07 };
+static const u8 hori_ff_autocenter_off[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x01, 0x00 };
+
+static const u8 hori_ff_effect_report[HORI_FFB_REPORT_LEN] = {
+	0x20, 0x02, 0x10, 0x00,
+	0x00, 0x00,			/* [4:6] force, signed LE */
+	0x00, 0x00,
+	0x10, 0x27, 0x00, 0x00,		/* 10000 */
+	0x10, 0x27, 0x00, 0x00,		/* 10000 */
+};
+
+/*
+ * The output reports are passed through a DMA capable buffer, USB cannot
+ * map stack memory.
+ */
+static void hori_ff_send(struct hori_device *hd, const u8 *data)
+{
+	memcpy(hd->outbuf, data, HORI_FFB_REPORT_LEN);
+
+	if (hid_hw_output_report(hd->hdev, hd->outbuf,
+				 HORI_FFB_REPORT_LEN) == -ENOSYS)
+		hid_hw_raw_request(hd->hdev, HORI_FFB_REPORT_ID, hd->outbuf,
+				   HORI_FFB_REPORT_LEN, HID_OUTPUT_REPORT,
+				   HID_REQ_SET_REPORT);
+}
+
+static void hori_ff_send_mode(struct hori_device *hd, u8 mode)
+{
+	u8 buf[HORI_FFB_REPORT_LEN];
+
+	memcpy(buf, hori_ff_effect_report, HORI_FFB_REPORT_LEN);
+	buf[3] = mode;
+	hori_ff_send(hd, buf);
+}
+
+static void hori_ff_arm(struct hori_device *hd)
+{
+	int i;
+
+	for (i = 0; i < 13; i++) {
+		hori_ff_send(hd, hori_ff_init_a);
+		hori_ff_send(hd, hori_ff_init_b);
+		hori_ff_send(hd, hori_ff_init_c);
+	}
+	hori_ff_send(hd, hori_ff_enable);
+	hori_ff_send_mode(hd, HORI_FFB_MODE_RESET);
+
+	/* The device needs a short spring phase before effects are accepted */
+	for (i = 0; i < 15; i++) {
+		hori_ff_send_mode(hd, HORI_FFB_MODE_SPRING);
+		msleep(8);
+	}
+}
+
+static void hori_ff_init_device(struct hori_device *hd)
+{
+	hori_ff_arm(hd);
+	hori_ff_send_mode(hd, HORI_FFB_MODE_OFF);
+	hd->mode = HORI_FFB_MODE_OFF;
+}
+
+static void hori_ff_workfn(struct work_struct *work)
+{
+	struct hori_device *hd = container_of(to_delayed_work(work),
+					      struct hori_device, ff_work);
+	u8 buf[HORI_FFB_REPORT_LEN];
+	unsigned long flags;
+	s32 force = 0;
+	bool constant = false, spring = false;
+	int i;
+
+	spin_lock_irqsave(&hd->lock, flags);
+	for (i = 0; i < HORI_FFB_MAX_EFFECTS; i++) {
+		struct hori_ff_effect *eff = &hd->effects[i];
+
+		if (!eff->active)
+			continue;
+		if (eff->length && time_after(jiffies, eff->start +
+					      msecs_to_jiffies(eff->length))) {
+			eff->active = false;
+			continue;
+		}
+
+		switch (eff->type) {
+		case FF_CONSTANT:
+			constant = true;
+			if (eff->direction >= 0x4000 && eff->direction < 0xc000)
+				force -= eff->level;
+			else
+				force += eff->level;
+			break;
+		case FF_SPRING:
+			spring = true;
+			break;
+		}
+	}
+	if (hd->autocenter)
+		spring = true;
+	force = force * hd->gain / 65535;
+	spin_unlock_irqrestore(&hd->lock, flags);
+
+	if (constant) {
+		s32 wire = force * HORI_FFB_FORCE_MAX / 32767;
+
+		if (wire > HORI_FFB_FORCE_MAX)
+			wire = HORI_FFB_FORCE_MAX;
+		if (wire < -HORI_FFB_FORCE_MAX)
+			wire = -HORI_FFB_FORCE_MAX;
+
+		if (hd->mode == HORI_FFB_MODE_OFF)
+			hori_ff_arm(hd);
+		hori_ff_send(hd, hori_ff_params);
+		hori_ff_send(hd, hori_ff_autocenter_off);
+		hori_ff_send(hd, hori_ff_enable);
+		memcpy(buf, hori_ff_effect_report, HORI_FFB_REPORT_LEN);
+		buf[3] = HORI_FFB_MODE_FORCE;
+		put_unaligned_le16((u16)wire, &buf[4]);
+		hori_ff_send(hd, buf);
+		hd->mode = HORI_FFB_MODE_FORCE;
+	} else if (spring) {
+		if (hd->mode == HORI_FFB_MODE_OFF)
+			hori_ff_arm(hd);
+		hori_ff_send_mode(hd, HORI_FFB_MODE_SPRING);
+		hd->mode = HORI_FFB_MODE_SPRING;
+	} else {
+		if (hd->mode != HORI_FFB_MODE_OFF) {
+			hori_ff_send_mode(hd, HORI_FFB_MODE_OFF);
+			hd->mode = HORI_FFB_MODE_OFF;
+		}
+		return;
+	}
+
+	spin_lock_irqsave(&hd->lock, flags);
+	if (!hd->stopping)
+		schedule_delayed_work(&hd->ff_work,
+				      msecs_to_jiffies(HORI_FFB_TICK_MS));
+	spin_unlock_irqrestore(&hd->lock, flags);
+}
+
+static int hori_ff_upload(struct input_dev *dev, struct ff_effect *effect,
+			  struct ff_effect *old)
+{
+	struct hori_device *hd = hori_from_input(dev);
+	struct hori_ff_effect *eff = &hd->effects[effect->id];
+	unsigned long flags;
+
+	spin_lock_irqsave(&hd->lock, flags);
+	eff->type = effect->type;
+	eff->direction = effect->direction;
+	eff->length = effect->replay.length;
+	if (effect->type == FF_CONSTANT)
+		eff->level = effect->u.constant.level;
+	spin_unlock_irqrestore(&hd->lock, flags);
+
+	return 0;
+}
+
+static int hori_ff_erase(struct input_dev *dev, int effect_id)
+{
+	struct hori_device *hd = hori_from_input(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&hd->lock, flags);
+	hd->effects[effect_id].active = false;
+	spin_unlock_irqrestore(&hd->lock, flags);
+
+	return 0;
+}
+
+static int hori_ff_playback(struct input_dev *dev, int effect_id, int value)
+{
+	struct hori_device *hd = hori_from_input(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&hd->lock, flags);
+	hd->effects[effect_id].active = value;
+	if (value)
+		hd->effects[effect_id].start = jiffies;
+	spin_unlock_irqrestore(&hd->lock, flags);
+
+	schedule_delayed_work(&hd->ff_work, 0);
+
+	return 0;
+}
+
+static void hori_ff_set_gain(struct input_dev *dev, u16 gain)
+{
+	struct hori_device *hd = hori_from_input(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&hd->lock, flags);
+	hd->gain = gain;
+	spin_unlock_irqrestore(&hd->lock, flags);
+}
+
+static void hori_ff_set_autocenter(struct input_dev *dev, u16 magnitude)
+{
+	struct hori_device *hd = hori_from_input(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&hd->lock, flags);
+	hd->autocenter = magnitude;
+	spin_unlock_irqrestore(&hd->lock, flags);
+
+	schedule_delayed_work(&hd->ff_work, 0);
+}
+
 static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {
 	u8 hat = data[1] & 0x0f;
@@ -212,14 +488,19 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 static int hori_raw_event(struct hid_device *hdev,
 			  struct hid_report *report, u8 *data, int len)
 {
+	struct hori_device *hd = hid_get_drvdata(hdev);
+
 	if (hdev->product != USB_DEVICE_ID_HORI_TRUCK_WHEEL)
 		return 0;
 
 	/* Several wheels report as this id when operating in emulation mode. */
-	struct input_dev *input_dev = hid_get_drvdata(hdev);
 
-	parse_tcs_axis_report(input_dev, data);
-	input_sync(input_dev);
+	/* Report 1 carries the wheel state, the 0x20 reports are FFB acks */
+	if (report->id != 1 || !hd->input)
+		return 0;
+
+	parse_tcs_axis_report(hd->input, data);
+	input_sync(hd->input);
 
 	return 0;
 }
@@ -231,8 +512,10 @@ static int hori_input_configured(struct hid_device *hdev,
 		return 0;
 
 	/* Several wheels report as this id when operating in emulation mode. */
+	struct hori_device *hd = hid_get_drvdata(hdev);
 	struct input_dev *input_dev = input->input;
-	hid_set_drvdata(hdev, input_dev);
+
+	hd->input = input_dev;
 
 	set_bit(EV_ABS, input_dev->evbit);
 
@@ -260,6 +543,22 @@ static int hori_input_configured(struct hid_device *hdev,
 	input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
 	input_set_abs_params(input_dev, ABS_MISC, 0, 255, 255, 0);
 
+	set_bit(FF_CONSTANT, input_dev->ffbit);
+	set_bit(FF_SPRING, input_dev->ffbit);
+	set_bit(FF_GAIN, input_dev->ffbit);
+	set_bit(FF_AUTOCENTER, input_dev->ffbit);
+
+	if (input_ff_create(input_dev, HORI_FFB_MAX_EFFECTS)) {
+		hid_err(hdev, "cannot create FF device\n");
+		return 0;
+	}
+
+	input_dev->ff->upload = hori_ff_upload;
+	input_dev->ff->erase = hori_ff_erase;
+	input_dev->ff->playback = hori_ff_playback;
+	input_dev->ff->set_gain = hori_ff_set_gain;
+	input_dev->ff->set_autocenter = hori_ff_set_autocenter;
+
 	return 0;
 }
 
@@ -281,6 +580,51 @@ static int hori_input_mapping(struct hid_device *dev, struct hid_input *input,
 	return 0;
 }
 
+static int hori_probe(struct hid_device *hdev, const struct hid_device_id *id)
+{
+	struct hori_device *hd;
+	int ret;
+
+	hd = devm_kzalloc(&hdev->dev, sizeof(*hd), GFP_KERNEL);
+	if (!hd)
+		return -ENOMEM;
+
+	hd->hdev = hdev;
+	hd->gain = 65535;
+	spin_lock_init(&hd->lock);
+	INIT_DELAYED_WORK(&hd->ff_work, hori_ff_workfn);
+	hid_set_drvdata(hdev, hd);
+
+	ret = hid_parse(hdev);
+	if (ret)
+		return ret;
+
+	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+	if (ret)
+		return ret;
+
+	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL)
+		hori_ff_init_device(hd);
+
+	return 0;
+}
+
+static void hori_remove(struct hid_device *hdev)
+{
+	struct hori_device *hd = hid_get_drvdata(hdev);
+	unsigned long flags;
+
+	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL) {
+		spin_lock_irqsave(&hd->lock, flags);
+		hd->stopping = true;
+		spin_unlock_irqrestore(&hd->lock, flags);
+		cancel_delayed_work_sync(&hd->ff_work);
+		hori_ff_send_mode(hd, HORI_FFB_MODE_OFF);
+	}
+
+	hid_hw_stop(hdev);
+}
+
 static const struct hid_device_id hori_devices[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_HORI, USB_DEVICE_ID_HORI_TRUCK_WHEEL) },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_HORI, USB_DEVICE_ID_HORI_TRUCK_SHIFTER) },
@@ -291,6 +635,8 @@ MODULE_DEVICE_TABLE(hid, hori_devices);
 static struct hid_driver hori_driver = {
 	.name = "hid-hori-control-systems",
 	.id_table = hori_devices,
+	.probe = hori_probe,
+	.remove = hori_remove,
 	.report_fixup = hori_report_fixup,
 	.input_mapping = hori_input_mapping,
 	.input_configured = hori_input_configured,
