@@ -14,6 +14,7 @@
 #include <linux/input.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/string.h>
@@ -74,6 +75,8 @@
  * byte | 0x80, e.g. 20 81 02 01 acks 20 01 02 01.
  */
 #define HORI_FFB_REPORT_ID	0x20
+#define HORI_CFG_REPORT_ID	0x21
+#define HORI_CFG_LEN		64
 #define HORI_FFB_PAYLOAD	31	/* bytes after the report id */
 #define HORI_FFB_SLOTS		16
 #define HORI_FFB_AC_SLOT	15	/* reserved for the autocenter spring */
@@ -120,6 +123,16 @@ struct hori_device {
 	bool ac_uploaded;
 	bool motor_on;
 	bool removed;
+
+	struct mutex cfg_lock;	/* config channel, cfg cache below */
+	struct delayed_work cfg_work;
+	u8 *cfg_out;
+	u8 *cfg_in;
+	u8 cur[4][3];		/* settings blocks as stored on the wheel */
+	u8 want[4][3];		/* settings blocks as requested via sysfs */
+	u8 cfg_slot;
+	bool cfg_valid;
+	bool has_cfg;
 };
 
 static struct hori_device *hori_from_input(struct input_dev *dev)
@@ -728,6 +741,323 @@ static void hori_ff_shutdown(struct hori_device *hd)
 		timer_delete_sync(&hd->slot[i].timer);
 }
 
+/* ------------------------------------------------------------------ */
+/* Config channel (Truck wheel): settings stored on the device         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The settings HORI Device Manager edits live in four blocks of the active
+ * profile. Each is read with A2 <0x08|set_cmd|slot> and written, inside an
+ * edit session, with A2 <set_cmd|slot> <data>:
+ *
+ *   wheel  (0x50): range = deg/10 (0 = game), deadzone 0..6, sensitivity 0..6
+ *   pedal  (0x60): throttle 0..6, brake 0..6, clutch 0..6
+ *   ffb    (0x70): strength 0..9, vibration 0..4, vibration 0..4
+ *   stick  (0x90): 0 = off, 0x81..0x83 = level 1..3
+ *
+ * sysfs reads come from a cache. Writes update the cache and are committed
+ * as one edit session after HORI_CFG_COMMIT_MS without further writes, so a
+ * dragged slider or a whole profile costs a single flash write.
+ */
+
+#define HORI_CFG_COMMIT_MS	500
+
+enum { HORI_BLK_WHEEL, HORI_BLK_PEDAL, HORI_BLK_FFB, HORI_BLK_STICK,
+       HORI_BLK_NUM };
+
+static const u8 hori_blk_cmd[HORI_BLK_NUM] = { 0x50, 0x60, 0x70, 0x90 };
+static const u8 hori_blk_len[HORI_BLK_NUM] = { 3, 3, 3, 1 };
+
+/*
+ * Send one config request and poll for its reply. The reply buffer keeps
+ * stale bytes from earlier replies, so a reply only counts once byte 1
+ * echoes the request and (byte 2 & mask) == val.
+ */
+static int hori_cfg_xfer(struct hori_device *hd, const u8 *req, size_t len,
+			 u8 mask, u8 val)
+{
+	u8 *out = hd->cfg_out, *in = hd->cfg_in;
+	int i, ret;
+
+	memset(out, 0, HORI_CFG_LEN);
+	out[0] = HORI_CFG_REPORT_ID;
+	memcpy(out + 1, req, len);
+
+	ret = hid_hw_output_report(hd->hdev, out, HORI_CFG_LEN);
+	if (ret == -ENOSYS)
+		ret = hid_hw_raw_request(hd->hdev, HORI_CFG_REPORT_ID, out,
+					 HORI_CFG_LEN, HID_OUTPUT_REPORT,
+					 HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < 25; i++) {
+		msleep(20);
+		ret = hid_hw_raw_request(hd->hdev, HORI_CFG_REPORT_ID, in,
+					 HORI_CFG_LEN, HID_INPUT_REPORT,
+					 HID_REQ_GET_REPORT);
+		if (ret < 4 || in[1] != out[1])
+			continue;
+		if ((in[2] & 0xf0) == 0xf0) {
+			hid_warn(hd->hdev, "config %02x %02x rejected, code %u\n",
+				 out[1], out[2], in[3]);
+			return -EIO;
+		}
+		if ((in[2] & mask) == val)
+			return 0;
+	}
+	return -ETIMEDOUT;
+}
+
+/* read the active slot and all four blocks into hd->cur (cfg_lock held) */
+static int hori_cfg_refresh(struct hori_device *hd)
+{
+	u8 req[2], slot;
+	int b, ret;
+
+	hd->cfg_valid = false;
+
+	/* different command class first, so a stale A2 reply can't match */
+	req[0] = 0xa1; req[1] = 0x01;
+	ret = hori_cfg_xfer(hd, req, 2, 0xff, 0x01);
+	if (ret)
+		return ret;
+
+	req[0] = 0xa2; req[1] = 0x08;			/* profile header */
+	ret = hori_cfg_xfer(hd, req, 2, 0xf8, 0x00);
+	if (ret)
+		return ret;
+	slot = hd->cfg_in[2] & 0x07;
+
+	for (b = 0; b < HORI_BLK_NUM; b++) {
+		req[1] = hori_blk_cmd[b] | 0x08 | slot;	/* read block */
+		ret = hori_cfg_xfer(hd, req, 2, 0xff, hori_blk_cmd[b] | slot);
+		if (ret)
+			return ret;
+		memcpy(hd->cur[b], hd->cfg_in + 3, hori_blk_len[b]);
+	}
+
+	hd->cfg_slot = slot;
+	memcpy(hd->want, hd->cur, sizeof(hd->want));
+	hd->cfg_valid = true;
+	return 0;
+}
+
+/* make sure the cache is loaded (cfg_lock held) */
+static int hori_cfg_ensure(struct hori_device *hd)
+{
+	return hd->cfg_valid ? 0 : hori_cfg_refresh(hd);
+}
+
+/* write every block whose wanted value differs (cfg_lock held) */
+static int hori_cfg_commit(struct hori_device *hd)
+{
+	u8 slot = hd->cfg_slot, req[5];
+	int b, ret, ret2;
+
+	if (!hd->cfg_valid || !memcmp(hd->want, hd->cur, sizeof(hd->want)))
+		return 0;
+
+	req[0] = 0xa1; req[1] = 0x02;			/* handshake */
+	ret = hori_cfg_xfer(hd, req, 2, 0xff, 0x02);
+	if (ret)
+		goto resync;
+
+	req[0] = 0xa2; req[1] = slot; req[2] = 0x01;	/* enter edit */
+	ret = hori_cfg_xfer(hd, req, 3, 0xff, slot);
+	if (ret)
+		goto resync;
+
+	for (b = 0; b < HORI_BLK_NUM && !ret; b++) {
+		if (!memcmp(hd->want[b], hd->cur[b], hori_blk_len[b]))
+			continue;
+		req[1] = hori_blk_cmd[b] | slot;
+		memcpy(req + 2, hd->want[b], hori_blk_len[b]);
+		ret = hori_cfg_xfer(hd, req, 2 + hori_blk_len[b], 0xff,
+				    hori_blk_cmd[b] | slot);
+		if (!ret)
+			memcpy(hd->cur[b], hd->want[b], hori_blk_len[b]);
+	}
+
+	req[1] = slot; req[2] = 0x02;			/* exit edit, always */
+	ret2 = hori_cfg_xfer(hd, req, 3, 0xff, slot);
+	if (!ret)
+		ret = ret2;
+	if (!ret)
+		return 0;
+resync:
+	hid_warn(hd->hdev, "saving wheel settings failed (%d)\n", ret);
+	hori_cfg_refresh(hd);	/* show what the wheel really has */
+	return ret;
+}
+
+static void hori_cfg_work(struct work_struct *work)
+{
+	struct hori_device *hd = container_of(to_delayed_work(work),
+					     struct hori_device, cfg_work);
+
+	mutex_lock(&hd->cfg_lock);
+	hori_cfg_commit(hd);
+	mutex_unlock(&hd->cfg_lock);
+}
+
+/* sysfs attributes ---------------------------------------------------- */
+
+enum hori_setting {
+	HORI_SET_RANGE,
+	HORI_SET_WHEEL_DEADZONE,
+	HORI_SET_WHEEL_SENSITIVITY,
+	HORI_SET_THROTTLE_SENSITIVITY,
+	HORI_SET_BRAKE_SENSITIVITY,
+	HORI_SET_CLUTCH_SENSITIVITY,
+	HORI_SET_FFB_STRENGTH,
+	HORI_SET_FFB_VIBRATION,
+	HORI_SET_STICK_LEVEL,
+};
+
+struct hori_attr {
+	struct device_attribute attr;
+	enum hori_setting setting;
+};
+
+/* user-visible value of a setting from a block cache */
+static int hori_setting_get(u8 blk[][3], enum hori_setting s)
+{
+	switch (s) {
+	case HORI_SET_RANGE:
+		/* 0 = "Game Setting", which behaves as the full 1800 degrees */
+		return blk[HORI_BLK_WHEEL][0] ? blk[HORI_BLK_WHEEL][0] * 10 : 1800;
+	case HORI_SET_WHEEL_DEADZONE:	 return blk[HORI_BLK_WHEEL][1] - 3;
+	case HORI_SET_WHEEL_SENSITIVITY: return blk[HORI_BLK_WHEEL][2] - 3;
+	case HORI_SET_THROTTLE_SENSITIVITY: return blk[HORI_BLK_PEDAL][0] - 3;
+	case HORI_SET_BRAKE_SENSITIVITY: return blk[HORI_BLK_PEDAL][1] - 3;
+	case HORI_SET_CLUTCH_SENSITIVITY: return blk[HORI_BLK_PEDAL][2] - 3;
+	case HORI_SET_FFB_STRENGTH:	 return blk[HORI_BLK_FFB][0] + 1;
+	case HORI_SET_FFB_VIBRATION:	 return blk[HORI_BLK_FFB][1] - 2;
+	case HORI_SET_STICK_LEVEL:	 return blk[HORI_BLK_STICK][0] & 0x03;
+	}
+	return 0;
+}
+
+/* validate a user value and store it into a block cache */
+static int hori_setting_put(u8 blk[][3], enum hori_setting s, int v)
+{
+	switch (s) {
+	case HORI_SET_RANGE:
+		/* 180..1800 in 90-degree steps; 0 selects "Game Setting" */
+		if (v && (v < 180 || v > 1800))
+			return -EINVAL;
+		blk[HORI_BLK_WHEEL][0] = v ? DIV_ROUND_CLOSEST(v, 90) * 9 : 0;
+		return 0;
+	case HORI_SET_WHEEL_DEADZONE:
+	case HORI_SET_WHEEL_SENSITIVITY:
+	case HORI_SET_THROTTLE_SENSITIVITY:
+	case HORI_SET_BRAKE_SENSITIVITY:
+	case HORI_SET_CLUTCH_SENSITIVITY:
+		if (v < -3 || v > 3)
+			return -EINVAL;
+		if (s == HORI_SET_WHEEL_DEADZONE)
+			blk[HORI_BLK_WHEEL][1] = v + 3;
+		else if (s == HORI_SET_WHEEL_SENSITIVITY)
+			blk[HORI_BLK_WHEEL][2] = v + 3;
+		else
+			blk[HORI_BLK_PEDAL][s - HORI_SET_THROTTLE_SENSITIVITY] = v + 3;
+		return 0;
+	case HORI_SET_FFB_STRENGTH:
+		if (v < 1 || v > 10)
+			return -EINVAL;
+		blk[HORI_BLK_FFB][0] = v - 1;
+		return 0;
+	case HORI_SET_FFB_VIBRATION:
+		if (v < -2 || v > 2)
+			return -EINVAL;
+		blk[HORI_BLK_FFB][1] = v + 2;
+		blk[HORI_BLK_FFB][2] = v + 2;
+		return 0;
+	case HORI_SET_STICK_LEVEL:
+		if (v < 0 || v > 3)
+			return -EINVAL;
+		blk[HORI_BLK_STICK][0] = v ? 0x80 | v : 0;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static ssize_t hori_attr_show(struct device *dev, struct device_attribute *a,
+			      char *buf)
+{
+	struct hori_device *hd = hid_get_drvdata(to_hid_device(dev));
+	struct hori_attr *ha = container_of(a, struct hori_attr, attr);
+	int ret, v = 0;
+
+	mutex_lock(&hd->cfg_lock);
+	ret = hori_cfg_ensure(hd);
+	if (!ret)
+		v = hori_setting_get(hd->want, ha->setting);
+	mutex_unlock(&hd->cfg_lock);
+
+	return ret ? ret : sysfs_emit(buf, "%d\n", v);
+}
+
+static ssize_t hori_attr_store(struct device *dev, struct device_attribute *a,
+			       const char *buf, size_t count)
+{
+	struct hori_device *hd = hid_get_drvdata(to_hid_device(dev));
+	struct hori_attr *ha = container_of(a, struct hori_attr, attr);
+	int ret, v;
+
+	ret = kstrtoint(buf, 10, &v);
+	if (ret)
+		return ret;
+
+	mutex_lock(&hd->cfg_lock);
+	ret = hori_cfg_ensure(hd);
+	if (!ret)
+		ret = hori_setting_put(hd->want, ha->setting, v);
+	mutex_unlock(&hd->cfg_lock);
+	if (ret)
+		return ret;
+
+	mod_delayed_work(system_wq, &hd->cfg_work,
+			 msecs_to_jiffies(HORI_CFG_COMMIT_MS));
+	return count;
+}
+
+#define HORI_ATTR(_name, _setting)					\
+	static struct hori_attr hori_attr_##_name = {			\
+		.attr = __ATTR(_name, 0664, hori_attr_show,		\
+			       hori_attr_store),			\
+		.setting = _setting,					\
+	}
+
+HORI_ATTR(range, HORI_SET_RANGE);
+HORI_ATTR(wheel_deadzone, HORI_SET_WHEEL_DEADZONE);
+HORI_ATTR(wheel_sensitivity, HORI_SET_WHEEL_SENSITIVITY);
+HORI_ATTR(throttle_sensitivity, HORI_SET_THROTTLE_SENSITIVITY);
+HORI_ATTR(brake_sensitivity, HORI_SET_BRAKE_SENSITIVITY);
+HORI_ATTR(clutch_sensitivity, HORI_SET_CLUTCH_SENSITIVITY);
+HORI_ATTR(ffb_strength, HORI_SET_FFB_STRENGTH);
+HORI_ATTR(ffb_vibration, HORI_SET_FFB_VIBRATION);
+HORI_ATTR(stick_level, HORI_SET_STICK_LEVEL);
+
+static struct attribute *hori_cfg_attrs[] = {
+	&hori_attr_range.attr.attr,
+	&hori_attr_wheel_deadzone.attr.attr,
+	&hori_attr_wheel_sensitivity.attr.attr,
+	&hori_attr_throttle_sensitivity.attr.attr,
+	&hori_attr_brake_sensitivity.attr.attr,
+	&hori_attr_clutch_sensitivity.attr.attr,
+	&hori_attr_ffb_strength.attr.attr,
+	&hori_attr_ffb_vibration.attr.attr,
+	&hori_attr_stick_level.attr.attr,
+	NULL,
+};
+
+static const struct attribute_group hori_cfg_group = {
+	.attrs = hori_cfg_attrs,
+};
+
+
 static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {
 	u8 hat = data[1] & 0x0f;
@@ -842,6 +1172,8 @@ static int hori_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	hd->hdev = hdev;
 	hd->gain = 0xffff;
 	spin_lock_init(&hd->lock);
+	mutex_init(&hd->cfg_lock);
+	INIT_DELAYED_WORK(&hd->cfg_work, hori_cfg_work);
 	for (i = 0; i < HORI_FFB_SLOTS; i++) {
 		hd->slot[i].hd = hd;
 		hd->slot[i].idx = i;
@@ -857,12 +1189,30 @@ static int hori_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (ret)
 		return ret;
 
+	/* settings are read lazily, so nothing is sent to the wheel here */
+	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL) {
+		hd->cfg_out = devm_kzalloc(&hdev->dev, HORI_CFG_LEN, GFP_KERNEL);
+		hd->cfg_in = devm_kzalloc(&hdev->dev, HORI_CFG_LEN, GFP_KERNEL);
+		if (hd->cfg_out && hd->cfg_in &&
+		    !sysfs_create_group(&hdev->dev.kobj, &hori_cfg_group))
+			hd->has_cfg = true;
+		else
+			hid_warn(hdev, "wheel settings attributes not available\n");
+	}
+
 	return 0;
 }
 
 static void hori_remove(struct hid_device *hdev)
 {
 	struct hori_device *hd = hid_get_drvdata(hdev);
+
+	if (hd->has_cfg) {
+		sysfs_remove_group(&hdev->dev.kobj, &hori_cfg_group);
+		/* save a pending change now (fails harmlessly if unplugged) */
+		flush_delayed_work(&hd->cfg_work);
+		cancel_delayed_work_sync(&hd->cfg_work);
+	}
 
 	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL)
 		hori_ff_shutdown(hd);
