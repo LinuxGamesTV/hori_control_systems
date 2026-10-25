@@ -1,13 +1,31 @@
 # This is a Experimental Linux Kernel driver (for kernels 6.12 or higher) for the Hori Truck Control System.
 
 All three pedals work now: Gas, brake and clutch.
-Force Feedback works now: constant force and centering spring, implemented through the reverse engineered vendor protocol (see the protocol notes in `hid-hori.c`). Games using SDL might need the environment variable `SDL_JOYSTICK_WHEEL_DEVICES=0x0f0d/0x017a` to recognize the wheel.
+Force Feedback works now: the wheel's own effect engine is used, so all Linux force feedback effects are supported (constant, ramp, sine/square/triangle/sawtooth, spring, damper, inertia, friction), plus gain and autocenter. The protocol notes are in `hid-hori.c`. Games using SDL might need the environment variable `SDL_JOYSTICK_WHEEL_DEVICES=0x0f0d/0x017a` to recognize the wheel. If forces feel mirrored in a game, load the module with `invert_ff=1`.
+
+The wheel settings from the HORI Device Manager can be changed from Linux. They appear as files in the wheel's sysfs directory and are saved on the wheel, like Device Manager does:
+
+| File | Values | Device Manager setting |
+|---|---|---|
+| `range` | 180-1800 in 90 degree steps, `0` = Game Setting | Steering Output Range |
+| `wheel_deadzone` | -3..3 | Dead Zone |
+| `wheel_sensitivity` | -3..3 | Sensitivity |
+| `throttle_sensitivity`, `brake_sensitivity`, `clutch_sensitivity` | -3..3 | Pedal Sensitivity |
+| `ffb_strength` | 1-10 | Force Feedback Adjustment |
+| `ffb_vibration` | -2..2 | Vibration (scales high frequency force feedback, e.g. engine rumble) |
+| `stick_level` | 0-3 | Analog Stick and D-pad |
+
+```shell
+W=$(ls -d /sys/bus/hid/drivers/hid-hori-control-systems/0003:0F0D:017A.*)
+cat $W/range
+echo 900 | sudo tee $W/range
+```
+
+Install the udev rules (`sudo make udev-rules`) to change them without root, e.g. from Oversteer.
 
 Button 5 cannot be used as return or left mouse button, because the button is not mappable as left mouse button/return key.
 The steering wheel behaves the same as under Windows. The left analog stick can now be used as a mouse.
 The dead zones have also been resolved and the hatswitch is working as expected.
-
-The dead zones and range from the Wheel are fixed at this moment and the driver does not yet have the userspace connection which will be used for the future Linux Hori Device Management GUI.
 
 The shifter is fully working now, too.
 
