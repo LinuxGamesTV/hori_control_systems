@@ -1071,9 +1071,14 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
 	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
 
-	/* Hat is always the upper nibble of the penultimate byte of the report. This hatswitch is very tricky */
-	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][2]);
-	input_report_abs(input_dev, ABS_HAT0Y, -hat_to_axis[hat][6]);
+	/*
+	 * The hat is the low nibble of byte 1: 0..7 = up, up-right, ...,
+	 * up-left; anything else (null state) = centred. hat_to_axis row 0
+	 * is centred, so direction n is row n + 1.
+	 */
+	hat = hat < 8 ? hat + 1 : 0;
+	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][0]);
+	input_report_abs(input_dev, ABS_HAT0Y, hat_to_axis[hat][1]);
 
 	input_report_abs(input_dev, ABS_MISC, data[26] << 8);
 }
