@@ -9,18 +9,25 @@
 #include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/fixp-arith.h>
 #include <linux/hid.h>
 #include <linux/input.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/string.h>
+#include <linux/timer.h>
 #include <linux/usb.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include <linux/unaligned.h>
+
+#ifndef timer_container_of		/* added in 6.16 */
+#define timer_container_of from_timer
+#endif
 
 #include "usbhid/usbhid.h"
 #include "hid-ids.h"
@@ -32,58 +39,100 @@
 #define JOY_RANGE	(BTN_DEAD - BTN_JOYSTICK + 1)
 
 /*
- * Force feedback protocol (reverse engineered from USB captures)
+ * Force feedback protocol
+ *
+ * Reverse engineered from HORI's DirectInput effect driver (HoriWFfb.dll,
+ * "HORI FFB RWD DRIVERS" 1.18) and verified on hardware and against USB
+ * captures of that driver.
  *
  * FFB commands are 32 byte vendor output reports (report id 0x20) sent to
- * the interrupt OUT endpoint (EP 2):
+ * the interrupt OUT endpoint. The wheel keeps up to 16 effects in slots and
+ * plays them itself; the host only uploads, starts and stops them.
  *
- *   20 01 <sub> <args>		configuration commands
- *   20 02 10 <mode> <force16> 00 00 <u32 10000> <u32 10000>
- *				effect state, mode:
- *				0x10 = reset (once at init)
- *				0x00 = all effects off (wheel moves freely)
- *				0x80 = centering spring (wheel returns to center)
- *				0x40 = constant force, force16 signed LE
- *					(full scale assumed +-10000)
+ *   20 01 <cmd> <arg>		device control
+ *	01 <1|0>		stop all effects / release stop
+ *	02 <1|0>		host control of the motor on / off; while off the
+ *				firmware applies its own centring spring
+ *	03 01			free all effect slots
+ *	(05 <u16>, a steering range sent by HORI's driver, is ignored by the
+ *	 Truck wheel; its range is a stored setting, see the config channel)
  *
- * Config subcommands seen in captures: 0x03 01 (init), 0x01 <0|1> (0 while
- * effects are driven), 0x02 <0|1> (1 enables effect updates) and
- * 0x05 00 08 07 (sent with every effect update, 0x0708 = 1800).
+ *   20 02 <type> <op|slot> <params...>	effect slot 0..15
+ *	type:	0x10 constant, 0x20 ramp, 0x31 square, 0x32 sine,
+ *		0x33 triangle, 0x34 saw up, 0x35 saw down,
+ *		0x41 spring, 0x42 damper, 0x43 inertia, 0x44 friction
+ *	op:	0x10 create, 0x00 update, 0x40 play, 0x80 stop, 0x20 free
+ *	params:	little endian u16/s16, magnitudes in +-10000, times in ms,
+ *		duration 0 = infinite. Envelope = attack level, attack time,
+ *		fade level, fade time.
+ *	constant:  level, duration, envelope
+ *	ramp:	   start, end, duration, envelope
+ *	periodic:  period, magnitude, phase (ms), offset, duration, envelope
+ *	condition: neg. coeff, neg. saturation, deadband, pos. coeff,
+ *		   pos. saturation, deadband, center, duration
  *
- * The device acks every command on the interrupt IN endpoint with the
- * command byte | 0x80, e.g. 20 81 02 01 acks 20 01 02 01.
+ * The wheel acks every command on the interrupt IN endpoint with the class
+ * byte | 0x80, e.g. 20 81 02 01 acks 20 01 02 01.
  */
 #define HORI_FFB_REPORT_ID	0x20
-#define HORI_FFB_REPORT_LEN	32
-#define HORI_FFB_MAX_EFFECTS	16
-#define HORI_FFB_FORCE_MAX	10000
-#define HORI_FFB_TICK_MS	8
+#define HORI_CFG_REPORT_ID	0x21
+#define HORI_CFG_LEN		64
+#define HORI_FFB_PAYLOAD	31	/* bytes after the report id */
+#define HORI_FFB_SLOTS		16
+#define HORI_FFB_AC_SLOT	15	/* reserved for the autocenter spring */
+#define HORI_FFB_USER_EFFECTS	15
+#define HORI_FFB_FULL		10000	/* device units for 100 % */
 
-#define HORI_FFB_MODE_OFF	0x00
-#define HORI_FFB_MODE_RESET	0x10
-#define HORI_FFB_MODE_FORCE	0x40
-#define HORI_FFB_MODE_SPRING	0x80
+#define HORI_FFB_CLASS_DEVCTL	0x01
+#define HORI_FFB_CLASS_EFFECT	0x02
 
-struct hori_ff_effect {
+#define HORI_FFB_STOPALL	0x01
+#define HORI_FFB_ACTUATORS	0x02
+#define HORI_FFB_RESET		0x03
+
+#define HORI_FFB_OP_UPDATE	0x00
+#define HORI_FFB_OP_CREATE	0x10
+#define HORI_FFB_OP_FREE	0x20
+#define HORI_FFB_OP_PLAY	0x40
+#define HORI_FFB_OP_STOP	0x80
+
+static bool invert_ff;
+module_param(invert_ff, bool, 0644);
+MODULE_PARM_DESC(invert_ff, "Mirror all forces left/right (default: N)");
+
+struct hori_device;
+
+struct hori_ff_slot {
+	struct hori_device *hd;
+	struct timer_list timer;
+	struct ff_effect eff;
+	unsigned int repeats;	/* plays left, including the current one */
+	u8 idx;
+	bool uploaded;
 	bool active;
-	u8 type;
-	s16 level;
-	u16 direction;
-	u16 length;
-	unsigned long start;
+	bool waiting_delay;
 };
 
 struct hori_device {
 	struct hid_device *hdev;
 	struct input_dev *input;
-	struct delayed_work ff_work;
-	spinlock_t lock;
-	u8 mode;
+	struct hid_report *ffb_report;
+	spinlock_t lock;	/* ffb_report values, slots, flags below */
+	struct hori_ff_slot slot[HORI_FFB_SLOTS];
 	u16 gain;
-	u16 autocenter;
-	bool stopping;
-	u8 outbuf[HORI_FFB_REPORT_LEN];
-	struct hori_ff_effect effects[HORI_FFB_MAX_EFFECTS];
+	bool ac_uploaded;
+	bool motor_on;
+	bool removed;
+
+	struct mutex cfg_lock;	/* config channel, cfg cache below */
+	struct delayed_work cfg_work;
+	u8 *cfg_out;
+	u8 *cfg_in;
+	u8 cur[4][3];		/* settings blocks as stored on the wheel */
+	u8 want[4][3];		/* settings blocks as requested via sysfs */
+	u8 cfg_slot;
+	bool cfg_valid;
+	bool has_cfg;
 };
 
 static struct hori_device *hori_from_input(struct input_dev *dev)
@@ -254,146 +303,254 @@ static const __u8 *hori_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 	return rdesc;
 }
 
-static const u8 hori_ff_init_a[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x03, 0x01 };
-static const u8 hori_ff_init_b[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x01, 0x01 };
-static const u8 hori_ff_init_c[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x02, 0x00 };
-static const u8 hori_ff_enable[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x02, 0x01 };
-static const u8 hori_ff_params[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x05, 0x00, 0x08, 0x07 };
-static const u8 hori_ff_autocenter_off[HORI_FFB_REPORT_LEN] = { 0x20, 0x01, 0x01, 0x00 };
+/*
+ * Effects are sent with hid_hw_request(), which usbhid queues on the
+ * interrupt OUT endpoint without sleeping, so this is safe from the
+ * playback, gain and autocenter callbacks (they run in atomic context).
+ * Caller holds hd->lock; data = the 31 bytes following the report id.
+ */
+static void hori_ff_send_locked(struct hori_device *hd, const u8 *data)
+{
+	struct hid_field *field;
+	int i;
 
-static const u8 hori_ff_effect_report[HORI_FFB_REPORT_LEN] = {
-	0x20, 0x02, 0x10, 0x00,
-	0x00, 0x00,			/* [4:6] force, signed LE */
-	0x00, 0x00,
-	0x10, 0x27, 0x00, 0x00,		/* 10000 */
-	0x10, 0x27, 0x00, 0x00,		/* 10000 */
-};
+	if (hd->removed)
+		return;
+
+	field = hd->ffb_report->field[0];
+	for (i = 0; i < HORI_FFB_PAYLOAD; i++)
+		field->value[i] = data[i];
+
+	hid_hw_request(hd->hdev, hd->ffb_report, HID_REQ_SET_REPORT);
+}
+
+static void hori_ff_devctl_locked(struct hori_device *hd, u8 cmd, u8 arg)
+{
+	u8 d[HORI_FFB_PAYLOAD] = { HORI_FFB_CLASS_DEVCTL, cmd, arg };
+
+	hori_ff_send_locked(hd, d);
+}
+
+static void hori_ff_motor_on_locked(struct hori_device *hd)
+{
+	if (hd->motor_on)
+		return;
+	hori_ff_devctl_locked(hd, HORI_FFB_STOPALL, 0);
+	hori_ff_devctl_locked(hd, HORI_FFB_ACTUATORS, 1);
+	hd->motor_on = true;
+}
+
+/* hand the wheel back to firmware centring once nothing is loaded */
+static void hori_ff_maybe_release_locked(struct hori_device *hd)
+{
+	int i;
+
+	if (!hd->motor_on || hd->ac_uploaded)
+		return;
+	for (i = 0; i < HORI_FFB_USER_EFFECTS; i++)
+		if (hd->slot[i].uploaded)
+			return;
+
+	hori_ff_devctl_locked(hd, HORI_FFB_STOPALL, 1);
+	hori_ff_devctl_locked(hd, HORI_FFB_ACTUATORS, 0);
+	hd->motor_on = false;
+}
+
+static s64 hori_div_round(s64 n, s32 d)
+{
+	return div_s64(n + (n < 0 ? -(d / 2) : d / 2), d);
+}
+
+/* v in [-in_max, in_max] -> device units [-10000, 10000], times gain */
+static s32 hori_ff_scale(s32 v, s32 in_max, u16 gain)
+{
+	s64 r = hori_div_round((s64)v * HORI_FFB_FULL, in_max);
+
+	r = hori_div_round(r * gain, 0xffff);
+	return clamp_t(s64, r, -HORI_FFB_FULL, HORI_FFB_FULL);
+}
 
 /*
- * The output reports are passed through a DMA capable buffer, USB cannot
- * map stack memory.
+ * Projection of an effect direction onto the wheel axis, -0x7fff..0x7fff.
+ * Linux 0x4000 (90 deg) maps to a negative level, which turns the wheel
+ * left; this matches HORI's DirectInput mapping (DI east -> left).
  */
-static void hori_ff_send(struct hori_device *hd, const u8 *data)
+static s32 hori_ff_dir_factor(u16 direction)
 {
-	memcpy(hd->outbuf, data, HORI_FFB_REPORT_LEN);
+	s32 f = -fixp_sin16(((u32)direction * 360) >> 16);
 
-	if (hid_hw_output_report(hd->hdev, hd->outbuf,
-				 HORI_FFB_REPORT_LEN) == -ENOSYS)
-		hid_hw_raw_request(hd->hdev, HORI_FFB_REPORT_ID, hd->outbuf,
-				   HORI_FFB_REPORT_LEN, HID_OUTPUT_REPORT,
-				   HID_REQ_SET_REPORT);
+	return invert_ff ? -f : f;
 }
 
-static void hori_ff_send_mode(struct hori_device *hd, u8 mode)
+static void hori_ff_put_env(u8 *p, const struct ff_envelope *env, u16 gain)
 {
-	u8 buf[HORI_FFB_REPORT_LEN];
+	/* without an envelope HORI's driver sends full levels, zero times */
+	u16 al = env->attack_length ? env->attack_level : 0x7fff;
+	u16 fl = env->fade_length ? env->fade_level : 0x7fff;
 
-	memcpy(buf, hori_ff_effect_report, HORI_FFB_REPORT_LEN);
-	buf[3] = mode;
-	hori_ff_send(hd, buf);
+	put_unaligned_le16(hori_ff_scale(al, 0x7fff, gain), p);
+	put_unaligned_le16(min_t(u32, env->attack_length, 0xffff), p + 2);
+	put_unaligned_le16(hori_ff_scale(fl, 0x7fff, gain), p + 4);
+	put_unaligned_le16(min_t(u32, env->fade_length, 0xffff), p + 6);
 }
 
-static void hori_ff_arm(struct hori_device *hd)
+static int hori_ff_build(const struct ff_effect *e, u8 slot, u8 op, u16 gain,
+			 u8 *d)
 {
-	int i;
+	u8 *p = d + 3;			/* report byte 4 */
+	u16 dur = min_t(u32, e->replay.length, 0xffff);	/* 0 = infinite */
+	s32 dirf;
 
-	for (i = 0; i < 13; i++) {
-		hori_ff_send(hd, hori_ff_init_a);
-		hori_ff_send(hd, hori_ff_init_b);
-		hori_ff_send(hd, hori_ff_init_c);
+	memset(d, 0, HORI_FFB_PAYLOAD);
+	d[0] = HORI_FFB_CLASS_EFFECT;
+	d[2] = op | slot;
+
+	switch (e->type) {
+	case FF_CONSTANT:
+		dirf = hori_ff_dir_factor(e->direction);
+		d[1] = 0x10;
+		put_unaligned_le16((s16)hori_ff_scale(e->u.constant.level * dirf
+						      / 0x7fff, 0x7fff, gain), p);
+		put_unaligned_le16(dur, p + 2);
+		hori_ff_put_env(p + 4, &e->u.constant.envelope, gain);
+		break;
+
+	case FF_RAMP:
+		dirf = hori_ff_dir_factor(e->direction);
+		d[1] = 0x20;
+		put_unaligned_le16((s16)hori_ff_scale(e->u.ramp.start_level * dirf
+						      / 0x7fff, 0x7fff, gain), p);
+		put_unaligned_le16((s16)hori_ff_scale(e->u.ramp.end_level * dirf
+						      / 0x7fff, 0x7fff, gain), p + 2);
+		put_unaligned_le16(dur, p + 4);
+		hori_ff_put_env(p + 6, &e->u.ramp.envelope, gain);
+		break;
+
+	case FF_PERIODIC: {
+		const struct ff_periodic_effect *pe = &e->u.periodic;
+		u16 period = pe->period ? clamp_t(u16, pe->period, 4, 10000) : 1;
+		u16 phase = pe->phase;
+		s32 mag, offset;
+
+		switch (pe->waveform) {
+		case FF_SQUARE:		d[1] = 0x31; break;
+		case FF_SINE:		d[1] = 0x32; break;
+		case FF_TRIANGLE:	d[1] = 0x33; break;
+		case FF_SAW_UP:		d[1] = 0x34; break;
+		case FF_SAW_DOWN:	d[1] = 0x35; break;
+		default:
+			return -EINVAL;
+		}
+
+		/*
+		 * Vibrations use only the sign of the direction, not its
+		 * projection: ff-core converts FF_RUMBLE to a sine with
+		 * direction 0, which would otherwise scale to nothing on a
+		 * one-axis wheel.
+		 */
+		dirf = hori_ff_dir_factor(e->direction);
+		mag = pe->magnitude;
+		offset = pe->offset;
+		if (dirf < 0) {
+			mag = -mag;
+			offset = -offset;
+		}
+		if (mag < 0) {		/* device magnitude is unsigned */
+			mag = -mag;
+			phase += 0x8000;
+		}
+
+		put_unaligned_le16(period, p);
+		put_unaligned_le16(hori_ff_scale(mag, 0x7fff, gain), p + 2);
+		put_unaligned_le16((u32)period * phase >> 16, p + 4);
+		put_unaligned_le16((s16)hori_ff_scale(offset, 0x7fff, gain), p + 6);
+		put_unaligned_le16(dur, p + 8);
+		hori_ff_put_env(p + 10, &pe->envelope, gain);
+		break;
 	}
-	hori_ff_send(hd, hori_ff_enable);
-	hori_ff_send_mode(hd, HORI_FFB_MODE_RESET);
 
-	/* The device needs a short spring phase before effects are accepted */
-	for (i = 0; i < 15; i++) {
-		hori_ff_send_mode(hd, HORI_FFB_MODE_SPRING);
-		msleep(8);
+	case FF_SPRING:
+	case FF_DAMPER:
+	case FF_INERTIA:
+	case FF_FRICTION: {
+		const struct ff_condition_effect *c = &e->u.condition[0];
+		s32 lc = c->left_coeff, rc = c->right_coeff;
+		u32 ls = c->left_saturation, rs = c->right_saturation;
+		s32 center = c->center;
+		s16 db = c->deadband * HORI_FFB_FULL / 0xffff;
+
+		d[1] = e->type == FF_SPRING ? 0x41 :
+		       e->type == FF_DAMPER ? 0x42 :
+		       e->type == FF_INERTIA ? 0x43 : 0x44;
+
+		if (invert_ff) {
+			swap(lc, rc);
+			swap(ls, rs);
+			center = -center;
+		}
+
+		put_unaligned_le16((s16)hori_ff_scale(lc, 0x7fff, gain), p);
+		put_unaligned_le16(hori_ff_scale(ls, 0xffff, gain), p + 2);
+		put_unaligned_le16(db, p + 4);
+		put_unaligned_le16((s16)hori_ff_scale(rc, 0x7fff, gain), p + 6);
+		put_unaligned_le16(hori_ff_scale(rs, 0xffff, gain), p + 8);
+		put_unaligned_le16(db, p + 10);
+		put_unaligned_le16((s16)hori_ff_scale(center, 0x7fff, 0xffff),
+				   p + 12);
+		put_unaligned_le16(dur, p + 14);
+		break;
 	}
+
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
-static void hori_ff_init_device(struct hori_device *hd)
+static void hori_ff_slot_op_locked(struct hori_device *hd,
+				   struct hori_ff_slot *s, u8 op)
 {
-	hori_ff_arm(hd);
-	hori_ff_send_mode(hd, HORI_FFB_MODE_OFF);
-	hd->mode = HORI_FFB_MODE_OFF;
+	u8 d[HORI_FFB_PAYLOAD];
+
+	if (!hori_ff_build(&s->eff, s->idx, op, hd->gain, d))
+		hori_ff_send_locked(hd, d);
 }
 
-static void hori_ff_workfn(struct work_struct *work)
+static void hori_ff_start_locked(struct hori_device *hd,
+				 struct hori_ff_slot *s)
 {
-	struct hori_device *hd = container_of(to_delayed_work(work),
-					      struct hori_device, ff_work);
-	u8 buf[HORI_FFB_REPORT_LEN];
+	s->waiting_delay = false;
+	hori_ff_motor_on_locked(hd);
+	hori_ff_slot_op_locked(hd, s, HORI_FFB_OP_PLAY);
+
+	/* replays beyond the first are host-timed, as in HORI's driver */
+	if (s->repeats > 1 && s->eff.replay.length)
+		mod_timer(&s->timer,
+			  jiffies + msecs_to_jiffies(s->eff.replay.length));
+}
+
+static void hori_ff_slot_timer(struct timer_list *t)
+{
+	struct hori_ff_slot *s = timer_container_of(s, t, timer);
+	struct hori_device *hd = s->hd;
 	unsigned long flags;
-	s32 force = 0;
-	bool constant = false, spring = false;
-	int i;
 
 	spin_lock_irqsave(&hd->lock, flags);
-	for (i = 0; i < HORI_FFB_MAX_EFFECTS; i++) {
-		struct hori_ff_effect *eff = &hd->effects[i];
+	if (!s->active || !s->uploaded || hd->removed)
+		goto out;
 
-		if (!eff->active)
-			continue;
-		if (eff->length && time_after(jiffies, eff->start +
-					      msecs_to_jiffies(eff->length))) {
-			eff->active = false;
-			continue;
-		}
-
-		switch (eff->type) {
-		case FF_CONSTANT:
-			constant = true;
-			if (eff->direction >= 0x4000 && eff->direction < 0xc000)
-				force -= eff->level;
-			else
-				force += eff->level;
-			break;
-		case FF_SPRING:
-			spring = true;
-			break;
-		}
-	}
-	if (hd->autocenter)
-		spring = true;
-	force = force * hd->gain / 65535;
-	spin_unlock_irqrestore(&hd->lock, flags);
-
-	if (constant) {
-		s32 wire = force * HORI_FFB_FORCE_MAX / 32767;
-
-		if (wire > HORI_FFB_FORCE_MAX)
-			wire = HORI_FFB_FORCE_MAX;
-		if (wire < -HORI_FFB_FORCE_MAX)
-			wire = -HORI_FFB_FORCE_MAX;
-
-		if (hd->mode == HORI_FFB_MODE_OFF)
-			hori_ff_arm(hd);
-		hori_ff_send(hd, hori_ff_params);
-		hori_ff_send(hd, hori_ff_autocenter_off);
-		hori_ff_send(hd, hori_ff_enable);
-		memcpy(buf, hori_ff_effect_report, HORI_FFB_REPORT_LEN);
-		buf[3] = HORI_FFB_MODE_FORCE;
-		put_unaligned_le16((u16)wire, &buf[4]);
-		hori_ff_send(hd, buf);
-		hd->mode = HORI_FFB_MODE_FORCE;
-	} else if (spring) {
-		if (hd->mode == HORI_FFB_MODE_OFF)
-			hori_ff_arm(hd);
-		hori_ff_send_mode(hd, HORI_FFB_MODE_SPRING);
-		hd->mode = HORI_FFB_MODE_SPRING;
+	if (s->waiting_delay) {
+		hori_ff_start_locked(hd, s);
+	} else if (--s->repeats) {
+		hori_ff_slot_op_locked(hd, s, HORI_FFB_OP_PLAY);
+		if (s->repeats > 1)
+			mod_timer(&s->timer, jiffies +
+				  msecs_to_jiffies(s->eff.replay.length));
 	} else {
-		if (hd->mode != HORI_FFB_MODE_OFF) {
-			hori_ff_send_mode(hd, HORI_FFB_MODE_OFF);
-			hd->mode = HORI_FFB_MODE_OFF;
-		}
-		return;
+		s->active = false;
 	}
-
-	spin_lock_irqsave(&hd->lock, flags);
-	if (!hd->stopping)
-		schedule_delayed_work(&hd->ff_work,
-				      msecs_to_jiffies(HORI_FFB_TICK_MS));
+out:
 	spin_unlock_irqrestore(&hd->lock, flags);
 }
 
@@ -401,45 +558,84 @@ static int hori_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 			  struct ff_effect *old)
 {
 	struct hori_device *hd = hori_from_input(dev);
-	struct hori_ff_effect *eff = &hd->effects[effect->id];
+	struct hori_ff_slot *s;
 	unsigned long flags;
+	u8 d[HORI_FFB_PAYLOAD];
+	int ret;
+
+	if (effect->id < 0 || effect->id >= HORI_FFB_USER_EFFECTS)
+		return -EINVAL;
+	s = &hd->slot[effect->id];
 
 	spin_lock_irqsave(&hd->lock, flags);
-	eff->type = effect->type;
-	eff->direction = effect->direction;
-	eff->length = effect->replay.length;
-	if (effect->type == FF_CONSTANT)
-		eff->level = effect->u.constant.level;
+	ret = hori_ff_build(effect, s->idx,
+			    s->uploaded ? HORI_FFB_OP_UPDATE : HORI_FFB_OP_CREATE,
+			    hd->gain, d);
+	if (!ret) {
+		hori_ff_motor_on_locked(hd);
+		hori_ff_send_locked(hd, d);
+		s->eff = *effect;
+		s->uploaded = true;
+	}
 	spin_unlock_irqrestore(&hd->lock, flags);
+	return ret;
+}
 
+static int hori_ff_erase(struct input_dev *dev, int id)
+{
+	struct hori_device *hd = hori_from_input(dev);
+	struct hori_ff_slot *s;
+	unsigned long flags;
+
+	if (id < 0 || id >= HORI_FFB_USER_EFFECTS)
+		return -EINVAL;
+	s = &hd->slot[id];
+
+	spin_lock_irqsave(&hd->lock, flags);
+	if (s->uploaded) {
+		timer_delete(&s->timer);
+		s->active = false;
+		hori_ff_slot_op_locked(hd, s, HORI_FFB_OP_FREE);
+		s->uploaded = false;
+		hori_ff_maybe_release_locked(hd);
+	}
+	spin_unlock_irqrestore(&hd->lock, flags);
 	return 0;
 }
 
-static int hori_ff_erase(struct input_dev *dev, int effect_id)
+static int hori_ff_playback(struct input_dev *dev, int id, int value)
 {
 	struct hori_device *hd = hori_from_input(dev);
+	struct hori_ff_slot *s;
 	unsigned long flags;
 
-	spin_lock_irqsave(&hd->lock, flags);
-	hd->effects[effect_id].active = false;
-	spin_unlock_irqrestore(&hd->lock, flags);
-
-	return 0;
-}
-
-static int hori_ff_playback(struct input_dev *dev, int effect_id, int value)
-{
-	struct hori_device *hd = hori_from_input(dev);
-	unsigned long flags;
+	if (id < 0 || id >= HORI_FFB_USER_EFFECTS)
+		return -EINVAL;
+	s = &hd->slot[id];
 
 	spin_lock_irqsave(&hd->lock, flags);
-	hd->effects[effect_id].active = value;
-	if (value)
-		hd->effects[effect_id].start = jiffies;
+	if (!s->uploaded) {
+		spin_unlock_irqrestore(&hd->lock, flags);
+		return -EINVAL;
+	}
+
+	timer_delete(&s->timer);
+	if (value > 0) {
+		s->active = true;
+		s->repeats = value;
+		if (s->eff.replay.delay) {
+			s->waiting_delay = true;
+			mod_timer(&s->timer, jiffies +
+				  msecs_to_jiffies(s->eff.replay.delay));
+		} else {
+			hori_ff_start_locked(hd, s);
+		}
+	} else {
+		s->active = false;
+		s->waiting_delay = false;
+		hori_ff_slot_op_locked(hd, s, HORI_FFB_OP_STOP);
+	}
 	spin_unlock_irqrestore(&hd->lock, flags);
-
-	schedule_delayed_work(&hd->ff_work, 0);
-
 	return 0;
 }
 
@@ -447,23 +643,420 @@ static void hori_ff_set_gain(struct input_dev *dev, u16 gain)
 {
 	struct hori_device *hd = hori_from_input(dev);
 	unsigned long flags;
+	int i;
 
 	spin_lock_irqsave(&hd->lock, flags);
 	hd->gain = gain;
+	for (i = 0; i < HORI_FFB_USER_EFFECTS; i++)
+		if (hd->slot[i].uploaded)
+			hori_ff_slot_op_locked(hd, &hd->slot[i],
+					       HORI_FFB_OP_UPDATE);
 	spin_unlock_irqrestore(&hd->lock, flags);
 }
 
-static void hori_ff_set_autocenter(struct input_dev *dev, u16 magnitude)
+static void hori_ff_set_autocenter(struct input_dev *dev, u16 value)
 {
 	struct hori_device *hd = hori_from_input(dev);
+	struct hori_ff_slot *s = &hd->slot[HORI_FFB_AC_SLOT];
 	unsigned long flags;
 
 	spin_lock_irqsave(&hd->lock, flags);
-	hd->autocenter = magnitude;
-	spin_unlock_irqrestore(&hd->lock, flags);
+	if (value) {
+		struct ff_condition_effect *c = &s->eff.u.condition[0];
 
-	schedule_delayed_work(&hd->ff_work, 0);
+		memset(&s->eff, 0, sizeof(s->eff));
+		s->eff.type = FF_SPRING;
+		c->left_coeff = c->right_coeff = value >> 1;
+		c->left_saturation = c->right_saturation = 0xffff;
+
+		hori_ff_motor_on_locked(hd);
+		hori_ff_slot_op_locked(hd, s, hd->ac_uploaded ?
+				       HORI_FFB_OP_UPDATE :
+				       HORI_FFB_OP_CREATE | HORI_FFB_OP_PLAY);
+		hd->ac_uploaded = true;
+	} else if (hd->ac_uploaded) {
+		hori_ff_slot_op_locked(hd, s, HORI_FFB_OP_STOP);
+		hori_ff_slot_op_locked(hd, s, HORI_FFB_OP_FREE);
+		hd->ac_uploaded = false;
+		hori_ff_maybe_release_locked(hd);
+	}
+	spin_unlock_irqrestore(&hd->lock, flags);
 }
+
+static int hori_ff_init(struct hori_device *hd, struct input_dev *input_dev)
+{
+	static const int ff_bits[] = {
+		FF_CONSTANT, FF_RAMP, FF_PERIODIC, FF_SQUARE, FF_SINE,
+		FF_TRIANGLE, FF_SAW_UP, FF_SAW_DOWN, FF_SPRING, FF_DAMPER,
+		FF_INERTIA, FF_FRICTION, FF_GAIN, FF_AUTOCENTER,
+	};
+	struct hid_report *rep;
+	struct ff_device *ff;
+	int i, ret;
+
+	rep = hd->hdev->report_enum[HID_OUTPUT_REPORT].report_id_hash[HORI_FFB_REPORT_ID];
+	if (!rep || rep->maxfield < 1 || rep->field[0]->report_size != 8 ||
+	    rep->field[0]->report_count < HORI_FFB_PAYLOAD) {
+		hid_warn(hd->hdev, "no FFB output report, force feedback disabled\n");
+		return -ENODEV;
+	}
+	hd->ffb_report = rep;
+
+	for (i = 0; i < ARRAY_SIZE(ff_bits); i++)
+		set_bit(ff_bits[i], input_dev->ffbit);
+
+	ret = input_ff_create(input_dev, HORI_FFB_USER_EFFECTS);
+	if (ret)
+		return ret;
+
+	/* ff->private is kfree()d by ff-core, so it is left unused */
+	ff = input_dev->ff;
+	ff->upload = hori_ff_upload;
+	ff->erase = hori_ff_erase;
+	ff->playback = hori_ff_playback;
+	ff->set_gain = hori_ff_set_gain;
+	ff->set_autocenter = hori_ff_set_autocenter;
+	return 0;
+}
+
+/* stop everything and give the wheel back to firmware centring */
+static void hori_ff_shutdown(struct hori_device *hd)
+{
+	unsigned long flags;
+	int i;
+
+	if (hd->ffb_report) {
+		spin_lock_irqsave(&hd->lock, flags);
+		for (i = 0; i < HORI_FFB_SLOTS; i++)
+			hd->slot[i].active = false;
+		hori_ff_devctl_locked(hd, HORI_FFB_RESET, 1);
+		hori_ff_devctl_locked(hd, HORI_FFB_STOPALL, 1);
+		hori_ff_devctl_locked(hd, HORI_FFB_ACTUATORS, 0);
+		hd->motor_on = false;
+		hd->removed = true;	/* no more reports after this */
+		spin_unlock_irqrestore(&hd->lock, flags);
+	}
+
+	for (i = 0; i < HORI_FFB_SLOTS; i++)
+		timer_delete_sync(&hd->slot[i].timer);
+}
+
+/* ------------------------------------------------------------------ */
+/* Config channel (Truck wheel): settings stored on the device         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The settings HORI Device Manager edits live in four blocks of the active
+ * profile. Each is read with A2 <0x08|set_cmd|slot> and written, inside an
+ * edit session, with A2 <set_cmd|slot> <data>:
+ *
+ *   wheel  (0x50): range = deg/10 (0 = game), deadzone 0..6, sensitivity 0..6
+ *   pedal  (0x60): throttle 0..6, brake 0..6, clutch 0..6
+ *   ffb    (0x70): strength 0..9, vibration 0..4, vibration 0..4
+ *   stick  (0x90): 0 = off, 0x81..0x83 = level 1..3
+ *
+ * sysfs reads come from a cache. Writes update the cache and are committed
+ * as one edit session after HORI_CFG_COMMIT_MS without further writes, so a
+ * dragged slider or a whole profile costs a single flash write.
+ */
+
+#define HORI_CFG_COMMIT_MS	500
+
+enum { HORI_BLK_WHEEL, HORI_BLK_PEDAL, HORI_BLK_FFB, HORI_BLK_STICK,
+       HORI_BLK_NUM };
+
+static const u8 hori_blk_cmd[HORI_BLK_NUM] = { 0x50, 0x60, 0x70, 0x90 };
+static const u8 hori_blk_len[HORI_BLK_NUM] = { 3, 3, 3, 1 };
+
+/*
+ * Send one config request and poll for its reply. The reply buffer keeps
+ * stale bytes from earlier replies, so a reply only counts once byte 1
+ * echoes the request and (byte 2 & mask) == val.
+ */
+static int hori_cfg_xfer(struct hori_device *hd, const u8 *req, size_t len,
+			 u8 mask, u8 val)
+{
+	u8 *out = hd->cfg_out, *in = hd->cfg_in;
+	int i, ret;
+
+	memset(out, 0, HORI_CFG_LEN);
+	out[0] = HORI_CFG_REPORT_ID;
+	memcpy(out + 1, req, len);
+
+	ret = hid_hw_output_report(hd->hdev, out, HORI_CFG_LEN);
+	if (ret == -ENOSYS)
+		ret = hid_hw_raw_request(hd->hdev, HORI_CFG_REPORT_ID, out,
+					 HORI_CFG_LEN, HID_OUTPUT_REPORT,
+					 HID_REQ_SET_REPORT);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < 25; i++) {
+		msleep(20);
+		ret = hid_hw_raw_request(hd->hdev, HORI_CFG_REPORT_ID, in,
+					 HORI_CFG_LEN, HID_INPUT_REPORT,
+					 HID_REQ_GET_REPORT);
+		if (ret < 4 || in[1] != out[1])
+			continue;
+		if ((in[2] & 0xf0) == 0xf0) {
+			hid_warn(hd->hdev, "config %02x %02x rejected, code %u\n",
+				 out[1], out[2], in[3]);
+			return -EIO;
+		}
+		if ((in[2] & mask) == val)
+			return 0;
+	}
+	return -ETIMEDOUT;
+}
+
+/* read the active slot and all four blocks into hd->cur (cfg_lock held) */
+static int hori_cfg_refresh(struct hori_device *hd)
+{
+	u8 req[2], slot;
+	int b, ret;
+
+	hd->cfg_valid = false;
+
+	/* different command class first, so a stale A2 reply can't match */
+	req[0] = 0xa1; req[1] = 0x01;
+	ret = hori_cfg_xfer(hd, req, 2, 0xff, 0x01);
+	if (ret)
+		return ret;
+
+	req[0] = 0xa2; req[1] = 0x08;			/* profile header */
+	ret = hori_cfg_xfer(hd, req, 2, 0xf8, 0x00);
+	if (ret)
+		return ret;
+	slot = hd->cfg_in[2] & 0x07;
+
+	for (b = 0; b < HORI_BLK_NUM; b++) {
+		req[1] = hori_blk_cmd[b] | 0x08 | slot;	/* read block */
+		ret = hori_cfg_xfer(hd, req, 2, 0xff, hori_blk_cmd[b] | slot);
+		if (ret)
+			return ret;
+		memcpy(hd->cur[b], hd->cfg_in + 3, hori_blk_len[b]);
+	}
+
+	hd->cfg_slot = slot;
+	memcpy(hd->want, hd->cur, sizeof(hd->want));
+	hd->cfg_valid = true;
+	return 0;
+}
+
+/* make sure the cache is loaded (cfg_lock held) */
+static int hori_cfg_ensure(struct hori_device *hd)
+{
+	return hd->cfg_valid ? 0 : hori_cfg_refresh(hd);
+}
+
+/* write every block whose wanted value differs (cfg_lock held) */
+static int hori_cfg_commit(struct hori_device *hd)
+{
+	u8 slot = hd->cfg_slot, req[5];
+	int b, ret, ret2;
+
+	if (!hd->cfg_valid || !memcmp(hd->want, hd->cur, sizeof(hd->want)))
+		return 0;
+
+	req[0] = 0xa1; req[1] = 0x02;			/* handshake */
+	ret = hori_cfg_xfer(hd, req, 2, 0xff, 0x02);
+	if (ret)
+		goto resync;
+
+	req[0] = 0xa2; req[1] = slot; req[2] = 0x01;	/* enter edit */
+	ret = hori_cfg_xfer(hd, req, 3, 0xff, slot);
+	if (ret)
+		goto resync;
+
+	for (b = 0; b < HORI_BLK_NUM && !ret; b++) {
+		if (!memcmp(hd->want[b], hd->cur[b], hori_blk_len[b]))
+			continue;
+		req[1] = hori_blk_cmd[b] | slot;
+		memcpy(req + 2, hd->want[b], hori_blk_len[b]);
+		ret = hori_cfg_xfer(hd, req, 2 + hori_blk_len[b], 0xff,
+				    hori_blk_cmd[b] | slot);
+		if (!ret)
+			memcpy(hd->cur[b], hd->want[b], hori_blk_len[b]);
+	}
+
+	req[1] = slot; req[2] = 0x02;			/* exit edit, always */
+	ret2 = hori_cfg_xfer(hd, req, 3, 0xff, slot);
+	if (!ret)
+		ret = ret2;
+	if (!ret)
+		return 0;
+resync:
+	hid_warn(hd->hdev, "saving wheel settings failed (%d)\n", ret);
+	hori_cfg_refresh(hd);	/* show what the wheel really has */
+	return ret;
+}
+
+static void hori_cfg_work(struct work_struct *work)
+{
+	struct hori_device *hd = container_of(to_delayed_work(work),
+					     struct hori_device, cfg_work);
+
+	mutex_lock(&hd->cfg_lock);
+	hori_cfg_commit(hd);
+	mutex_unlock(&hd->cfg_lock);
+}
+
+/* sysfs attributes ---------------------------------------------------- */
+
+enum hori_setting {
+	HORI_SET_RANGE,
+	HORI_SET_WHEEL_DEADZONE,
+	HORI_SET_WHEEL_SENSITIVITY,
+	HORI_SET_THROTTLE_SENSITIVITY,
+	HORI_SET_BRAKE_SENSITIVITY,
+	HORI_SET_CLUTCH_SENSITIVITY,
+	HORI_SET_FFB_STRENGTH,
+	HORI_SET_FFB_VIBRATION,
+	HORI_SET_STICK_LEVEL,
+};
+
+struct hori_attr {
+	struct device_attribute attr;
+	enum hori_setting setting;
+};
+
+/* user-visible value of a setting from a block cache */
+static int hori_setting_get(u8 blk[][3], enum hori_setting s)
+{
+	switch (s) {
+	case HORI_SET_RANGE:
+		/* 0 = "Game Setting", which behaves as the full 1800 degrees */
+		return blk[HORI_BLK_WHEEL][0] ? blk[HORI_BLK_WHEEL][0] * 10 : 1800;
+	case HORI_SET_WHEEL_DEADZONE:	 return blk[HORI_BLK_WHEEL][1] - 3;
+	case HORI_SET_WHEEL_SENSITIVITY: return blk[HORI_BLK_WHEEL][2] - 3;
+	case HORI_SET_THROTTLE_SENSITIVITY: return blk[HORI_BLK_PEDAL][0] - 3;
+	case HORI_SET_BRAKE_SENSITIVITY: return blk[HORI_BLK_PEDAL][1] - 3;
+	case HORI_SET_CLUTCH_SENSITIVITY: return blk[HORI_BLK_PEDAL][2] - 3;
+	case HORI_SET_FFB_STRENGTH:	 return blk[HORI_BLK_FFB][0] + 1;
+	case HORI_SET_FFB_VIBRATION:	 return blk[HORI_BLK_FFB][1] - 2;
+	case HORI_SET_STICK_LEVEL:	 return blk[HORI_BLK_STICK][0] & 0x03;
+	}
+	return 0;
+}
+
+/* validate a user value and store it into a block cache */
+static int hori_setting_put(u8 blk[][3], enum hori_setting s, int v)
+{
+	switch (s) {
+	case HORI_SET_RANGE:
+		/* 180..1800 in 90-degree steps; 0 selects "Game Setting" */
+		if (v && (v < 180 || v > 1800))
+			return -EINVAL;
+		blk[HORI_BLK_WHEEL][0] = v ? DIV_ROUND_CLOSEST(v, 90) * 9 : 0;
+		return 0;
+	case HORI_SET_WHEEL_DEADZONE:
+	case HORI_SET_WHEEL_SENSITIVITY:
+	case HORI_SET_THROTTLE_SENSITIVITY:
+	case HORI_SET_BRAKE_SENSITIVITY:
+	case HORI_SET_CLUTCH_SENSITIVITY:
+		if (v < -3 || v > 3)
+			return -EINVAL;
+		if (s == HORI_SET_WHEEL_DEADZONE)
+			blk[HORI_BLK_WHEEL][1] = v + 3;
+		else if (s == HORI_SET_WHEEL_SENSITIVITY)
+			blk[HORI_BLK_WHEEL][2] = v + 3;
+		else
+			blk[HORI_BLK_PEDAL][s - HORI_SET_THROTTLE_SENSITIVITY] = v + 3;
+		return 0;
+	case HORI_SET_FFB_STRENGTH:
+		if (v < 1 || v > 10)
+			return -EINVAL;
+		blk[HORI_BLK_FFB][0] = v - 1;
+		return 0;
+	case HORI_SET_FFB_VIBRATION:
+		if (v < -2 || v > 2)
+			return -EINVAL;
+		blk[HORI_BLK_FFB][1] = v + 2;
+		blk[HORI_BLK_FFB][2] = v + 2;
+		return 0;
+	case HORI_SET_STICK_LEVEL:
+		if (v < 0 || v > 3)
+			return -EINVAL;
+		blk[HORI_BLK_STICK][0] = v ? 0x80 | v : 0;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static ssize_t hori_attr_show(struct device *dev, struct device_attribute *a,
+			      char *buf)
+{
+	struct hori_device *hd = hid_get_drvdata(to_hid_device(dev));
+	struct hori_attr *ha = container_of(a, struct hori_attr, attr);
+	int ret, v = 0;
+
+	mutex_lock(&hd->cfg_lock);
+	ret = hori_cfg_ensure(hd);
+	if (!ret)
+		v = hori_setting_get(hd->want, ha->setting);
+	mutex_unlock(&hd->cfg_lock);
+
+	return ret ? ret : sysfs_emit(buf, "%d\n", v);
+}
+
+static ssize_t hori_attr_store(struct device *dev, struct device_attribute *a,
+			       const char *buf, size_t count)
+{
+	struct hori_device *hd = hid_get_drvdata(to_hid_device(dev));
+	struct hori_attr *ha = container_of(a, struct hori_attr, attr);
+	int ret, v;
+
+	ret = kstrtoint(buf, 10, &v);
+	if (ret)
+		return ret;
+
+	mutex_lock(&hd->cfg_lock);
+	ret = hori_cfg_ensure(hd);
+	if (!ret)
+		ret = hori_setting_put(hd->want, ha->setting, v);
+	mutex_unlock(&hd->cfg_lock);
+	if (ret)
+		return ret;
+
+	mod_delayed_work(system_wq, &hd->cfg_work,
+			 msecs_to_jiffies(HORI_CFG_COMMIT_MS));
+	return count;
+}
+
+#define HORI_ATTR(_name, _setting)					\
+	static struct hori_attr hori_attr_##_name = {			\
+		.attr = __ATTR(_name, 0664, hori_attr_show,		\
+			       hori_attr_store),			\
+		.setting = _setting,					\
+	}
+
+HORI_ATTR(range, HORI_SET_RANGE);
+HORI_ATTR(wheel_deadzone, HORI_SET_WHEEL_DEADZONE);
+HORI_ATTR(wheel_sensitivity, HORI_SET_WHEEL_SENSITIVITY);
+HORI_ATTR(throttle_sensitivity, HORI_SET_THROTTLE_SENSITIVITY);
+HORI_ATTR(brake_sensitivity, HORI_SET_BRAKE_SENSITIVITY);
+HORI_ATTR(clutch_sensitivity, HORI_SET_CLUTCH_SENSITIVITY);
+HORI_ATTR(ffb_strength, HORI_SET_FFB_STRENGTH);
+HORI_ATTR(ffb_vibration, HORI_SET_FFB_VIBRATION);
+HORI_ATTR(stick_level, HORI_SET_STICK_LEVEL);
+
+static struct attribute *hori_cfg_attrs[] = {
+	&hori_attr_range.attr.attr,
+	&hori_attr_wheel_deadzone.attr.attr,
+	&hori_attr_wheel_sensitivity.attr.attr,
+	&hori_attr_throttle_sensitivity.attr.attr,
+	&hori_attr_brake_sensitivity.attr.attr,
+	&hori_attr_clutch_sensitivity.attr.attr,
+	&hori_attr_ffb_strength.attr.attr,
+	&hori_attr_ffb_vibration.attr.attr,
+	&hori_attr_stick_level.attr.attr,
+	NULL,
+};
+
+static const struct attribute_group hori_cfg_group = {
+	.attrs = hori_cfg_attrs,
+};
+
 
 static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {
@@ -478,9 +1071,14 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
 	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
 
-	/* Hat is always the upper nibble of the penultimate byte of the report. This hatswitch is very tricky */
-	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][2]);
-	input_report_abs(input_dev, ABS_HAT0Y, -hat_to_axis[hat][6]);
+	/*
+	 * The hat is the low nibble of byte 1: 0..7 = up, up-right, ...,
+	 * up-left; anything else (null state) = centred. hat_to_axis row 0
+	 * is centred, so direction n is row n + 1.
+	 */
+	hat = hat < 8 ? hat + 1 : 0;
+	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][0]);
+	input_report_abs(input_dev, ABS_HAT0Y, hat_to_axis[hat][1]);
 
 	input_report_abs(input_dev, ABS_MISC, data[26] << 8);
 }
@@ -543,21 +1141,8 @@ static int hori_input_configured(struct hid_device *hdev,
 	input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
 	input_set_abs_params(input_dev, ABS_MISC, 0, 255, 255, 0);
 
-	set_bit(FF_CONSTANT, input_dev->ffbit);
-	set_bit(FF_SPRING, input_dev->ffbit);
-	set_bit(FF_GAIN, input_dev->ffbit);
-	set_bit(FF_AUTOCENTER, input_dev->ffbit);
-
-	if (input_ff_create(input_dev, HORI_FFB_MAX_EFFECTS)) {
-		hid_err(hdev, "cannot create FF device\n");
-		return 0;
-	}
-
-	input_dev->ff->upload = hori_ff_upload;
-	input_dev->ff->erase = hori_ff_erase;
-	input_dev->ff->playback = hori_ff_playback;
-	input_dev->ff->set_gain = hori_ff_set_gain;
-	input_dev->ff->set_autocenter = hori_ff_set_autocenter;
+	if (hori_ff_init(hd, input_dev))
+		hid_warn(hdev, "force feedback not available\n");
 
 	return 0;
 }
@@ -583,16 +1168,22 @@ static int hori_input_mapping(struct hid_device *dev, struct hid_input *input,
 static int hori_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct hori_device *hd;
-	int ret;
+	int i, ret;
 
 	hd = devm_kzalloc(&hdev->dev, sizeof(*hd), GFP_KERNEL);
 	if (!hd)
 		return -ENOMEM;
 
 	hd->hdev = hdev;
-	hd->gain = 65535;
+	hd->gain = 0xffff;
 	spin_lock_init(&hd->lock);
-	INIT_DELAYED_WORK(&hd->ff_work, hori_ff_workfn);
+	mutex_init(&hd->cfg_lock);
+	INIT_DELAYED_WORK(&hd->cfg_work, hori_cfg_work);
+	for (i = 0; i < HORI_FFB_SLOTS; i++) {
+		hd->slot[i].hd = hd;
+		hd->slot[i].idx = i;
+		timer_setup(&hd->slot[i].timer, hori_ff_slot_timer, 0);
+	}
 	hid_set_drvdata(hdev, hd);
 
 	ret = hid_parse(hdev);
@@ -603,8 +1194,16 @@ static int hori_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	if (ret)
 		return ret;
 
-	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL)
-		hori_ff_init_device(hd);
+	/* settings are read lazily, so nothing is sent to the wheel here */
+	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL) {
+		hd->cfg_out = devm_kzalloc(&hdev->dev, HORI_CFG_LEN, GFP_KERNEL);
+		hd->cfg_in = devm_kzalloc(&hdev->dev, HORI_CFG_LEN, GFP_KERNEL);
+		if (hd->cfg_out && hd->cfg_in &&
+		    !sysfs_create_group(&hdev->dev.kobj, &hori_cfg_group))
+			hd->has_cfg = true;
+		else
+			hid_warn(hdev, "wheel settings attributes not available\n");
+	}
 
 	return 0;
 }
@@ -612,15 +1211,16 @@ static int hori_probe(struct hid_device *hdev, const struct hid_device_id *id)
 static void hori_remove(struct hid_device *hdev)
 {
 	struct hori_device *hd = hid_get_drvdata(hdev);
-	unsigned long flags;
 
-	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL) {
-		spin_lock_irqsave(&hd->lock, flags);
-		hd->stopping = true;
-		spin_unlock_irqrestore(&hd->lock, flags);
-		cancel_delayed_work_sync(&hd->ff_work);
-		hori_ff_send_mode(hd, HORI_FFB_MODE_OFF);
+	if (hd->has_cfg) {
+		sysfs_remove_group(&hdev->dev.kobj, &hori_cfg_group);
+		/* save a pending change now (fails harmlessly if unplugged) */
+		flush_delayed_work(&hd->cfg_work);
+		cancel_delayed_work_sync(&hd->cfg_work);
 	}
+
+	if (hdev->product == USB_DEVICE_ID_HORI_TRUCK_WHEEL)
+		hori_ff_shutdown(hd);
 
 	hid_hw_stop(hdev);
 }
