@@ -374,10 +374,21 @@ static s32 hori_ff_scale(s32 v, s32 in_max, u16 gain)
  * Projection of an effect direction onto the wheel axis, -0x7fff..0x7fff.
  * Linux 0x4000 (90 deg) maps to a negative level, which turns the wheel
  * left; this matches HORI's DirectInput mapping (DI east -> left).
+ *
+ * Some stacks deliver the force on a Y axis instead: the SDL translation
+ * Wine uses for Proton turns a 90 deg DirectInput effect into direction 0,
+ * whose X projection is zero and would drop the force completely.  Take
+ * whichever projection is larger so that 0/0x8000 behave like
+ * 0x4000/0xc000 and turn the wheel the same way.
  */
 static s32 hori_ff_dir_factor(u16 direction)
 {
-	s32 f = -fixp_sin16(((u32)direction * 360) >> 16);
+	u32 deg = ((u32)direction * 360) >> 16;
+	s32 f = -fixp_sin16(deg);
+	s32 fy = -fixp_cos16(deg);
+
+	if (abs(fy) > abs(f))
+		f = fy;
 
 	return invert_ff ? -f : f;
 }
@@ -1062,9 +1073,9 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {
 	u8 hat = data[1] & 0x0f;
 
-	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[13]));
+	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[9]));
 	input_report_abs(input_dev, ABS_Y, get_unaligned_le16(&data[11]));
-	input_report_abs(input_dev, ABS_WHEEL, get_unaligned_le16(&data[9]));
+	input_report_abs(input_dev, ABS_Z, get_unaligned_le16(&data[13]));
 	input_report_abs(input_dev, ABS_RX, get_unaligned_le16(&data[15]));
 	input_report_abs(input_dev, ABS_RY, get_unaligned_le16(&data[17]));
 	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
@@ -1119,7 +1130,7 @@ static int hori_input_configured(struct hid_device *hdev,
 
 	set_bit(ABS_X, input_dev->absbit);
 	set_bit(ABS_Y, input_dev->absbit);
-	set_bit(ABS_WHEEL, input_dev->absbit);
+	set_bit(ABS_Z, input_dev->absbit);
 	set_bit(ABS_RX, input_dev->absbit);
 	set_bit(ABS_RY, input_dev->absbit);
 	set_bit(ABS_CLUTCH, input_dev->absbit);
@@ -1129,9 +1140,19 @@ static int hori_input_configured(struct hid_device *hdev,
 	set_bit(ABS_HAT0Y, input_dev->absbit);
 	set_bit(ABS_MISC, input_dev->absbit);
 
+	/*
+	 * The axis codes are picked so that ascending code order matches the
+	 * device's own HID descriptor (and HORI's Windows layout): wheel on
+	 * X, mini sticks on Y/Z and Rx/Ry, clutch on Rz and the pedals on
+	 * the slider axes.  Wine's SDL bus assigns HID usages in code order,
+	 * so Proton games see the same axes as on Windows: the clutch lands
+	 * on Rz instead of "right stick Y" (whose resting value of 0 reads
+	 * as a held stick and auto-scrolls menus), and the wheel lands on X
+	 * where games expect it for force feedback.
+	 */
 	input_set_abs_params(input_dev, ABS_X, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_Y, 0, 65535, 0, 0);
-	input_set_abs_params(input_dev, ABS_WHEEL, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_Z, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_RX, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_RY, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 0, 0);
