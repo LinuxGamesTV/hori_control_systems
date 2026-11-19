@@ -35,7 +35,7 @@
 #define HORI_TCS_WHEEL_RDESC_ORIG_SIZE		155
 #define HORI_TCS_SHIFTER_RDESC_ORIG_SIZE	83
 
-#define ABS_CLUTCH      ABS_RZ
+#define ABS_CLUTCH      0x0b
 #define JOY_RANGE	(BTN_DEAD - BTN_JOYSTICK + 1)
 
 /*
@@ -1073,9 +1073,9 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {
 	u8 hat = data[1] & 0x0f;
 
-	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[9]));
+	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[13]));
 	input_report_abs(input_dev, ABS_Y, get_unaligned_le16(&data[11]));
-	input_report_abs(input_dev, ABS_Z, get_unaligned_le16(&data[13]));
+	input_report_abs(input_dev, ABS_WHEEL, get_unaligned_le16(&data[9]));
 	input_report_abs(input_dev, ABS_RX, get_unaligned_le16(&data[15]));
 	input_report_abs(input_dev, ABS_RY, get_unaligned_le16(&data[17]));
 	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
@@ -1130,7 +1130,7 @@ static int hori_input_configured(struct hid_device *hdev,
 
 	set_bit(ABS_X, input_dev->absbit);
 	set_bit(ABS_Y, input_dev->absbit);
-	set_bit(ABS_Z, input_dev->absbit);
+	set_bit(ABS_WHEEL, input_dev->absbit);
 	set_bit(ABS_RX, input_dev->absbit);
 	set_bit(ABS_RY, input_dev->absbit);
 	set_bit(ABS_CLUTCH, input_dev->absbit);
@@ -1152,7 +1152,7 @@ static int hori_input_configured(struct hid_device *hdev,
 	 */
 	input_set_abs_params(input_dev, ABS_X, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_Y, 0, 65535, 0, 0);
-	input_set_abs_params(input_dev, ABS_Z, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_WHEEL, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_RX, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_RY, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 0, 0);
