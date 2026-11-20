@@ -1079,7 +1079,7 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 	input_report_abs(input_dev, ABS_RX, get_unaligned_le16(&data[15]));
 	input_report_abs(input_dev, ABS_RY, get_unaligned_le16(&data[17]));
 	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
-	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
+	input_report_abs(input_dev, ABS_THROTTLE, get_unaligned_le16(&data[21]));
 	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
 
 	/*
@@ -1134,7 +1134,7 @@ static int hori_input_configured(struct hid_device *hdev,
 	set_bit(ABS_RX, input_dev->absbit);
 	set_bit(ABS_RY, input_dev->absbit);
 	set_bit(ABS_CLUTCH, input_dev->absbit);
-	set_bit(ABS_GAS, input_dev->absbit);
+	set_bit(ABS_THROTTLE, input_dev->absbit);
 	set_bit(ABS_BRAKE, input_dev->absbit);
 	set_bit(ABS_HAT0X, input_dev->absbit);
 	set_bit(ABS_HAT0Y, input_dev->absbit);
@@ -1156,7 +1156,7 @@ static int hori_input_configured(struct hid_device *hdev,
 	input_set_abs_params(input_dev, ABS_RX, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_RY, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 0, 0);
-	input_set_abs_params(input_dev, ABS_GAS, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_THROTTLE, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_BRAKE, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_HAT0X, -1, 1, 0, 0);
 	input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
