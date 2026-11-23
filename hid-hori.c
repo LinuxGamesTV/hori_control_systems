@@ -1154,7 +1154,7 @@ static int hori_input_open(struct input_dev *dev)
 
 	if (hd->swap_mode == HORI_SWAP_AUTO) {
 		hd->swap_axes = hori_is_wine_or_proton();
-		hid_info(hd->hdev, "opened by '%s' -> auto swap Nattive to Wine/Proton: %s\n",
+		hid_info(hd->hdev, "opened by '%s' -> auto swap Native to Wine/Proton: %s\n",
 			 current->comm, hd->swap_axes ? "yes" : "no");
 	}
 
