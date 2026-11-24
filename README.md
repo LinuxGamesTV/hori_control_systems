@@ -14,6 +14,7 @@ The wheel settings from the HORI Device Manager can be changed from Linux. They 
 | `ffb_strength` | 1-10 | Force Feedback Adjustment |
 | `ffb_vibration` | -2..2 | Vibration (scales high frequency force feedback, e.g. engine rumble) |
 | `stick_level` | 0-3 | Analog Stick and D-pad |
+| `swapp` |auto, on, off | Switch Axis from Linux native to Wine/Proton  config |
 
 ```shell
 W=$(ls -d /sys/bus/hid/drivers/hid-hori-control-systems/0003:0F0D:017A.*)

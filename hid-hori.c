@@ -7,13 +7,17 @@
 
 #include <linux/bits.h>
 #include <linux/crc32.h>
+#include <linux/rcupdate.h>
+#include <linux/dcache.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/fixp-arith.h>
+#include <linux/fs.h>
 #include <linux/hid.h>
 #include <linux/input.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/sched.h>
@@ -29,8 +33,10 @@
 #define timer_container_of from_timer
 #endif
 
+#include "input-event-codes.h" 
 #include "usbhid/usbhid.h"
 #include "hid-ids.h"
+
 
 #define HORI_TCS_WHEEL_RDESC_ORIG_SIZE		155
 #define HORI_TCS_SHIFTER_RDESC_ORIG_SIZE	83
@@ -100,6 +106,12 @@ static bool invert_ff;
 module_param(invert_ff, bool, 0644);
 MODULE_PARM_DESC(invert_ff, "Mirror all forces left/right (default: N)");
 
+enum hori_swap_mode {
+	HORI_SWAP_AUTO = 0,
+	HORI_SWAP_OFF  = 1,
+	HORI_SWAP_ON   = 2,
+};
+
 struct hori_device;
 
 struct hori_ff_slot {
@@ -116,6 +128,9 @@ struct hori_ff_slot {
 struct hori_device {
 	struct hid_device *hdev;
 	struct input_dev *input;
+	int (*orig_open)(struct input_dev *dev);
+	enum hori_swap_mode swap_mode;
+	bool swap_axes;
 	struct hid_report *ffb_report;
 	spinlock_t lock;	/* ffb_report values, slots, flags below */
 	struct hori_ff_slot slot[HORI_FFB_SLOTS];
@@ -1051,6 +1066,49 @@ HORI_ATTR(ffb_strength, HORI_SET_FFB_STRENGTH);
 HORI_ATTR(ffb_vibration, HORI_SET_FFB_VIBRATION);
 HORI_ATTR(stick_level, HORI_SET_STICK_LEVEL);
 
+static ssize_t swap_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct hori_device *hd = hid_get_drvdata(to_hid_device(dev));
+	const char *mode_str;
+
+	switch (hd->swap_mode) {
+	case HORI_SWAP_OFF:
+		mode_str = "off";
+		break;
+	case HORI_SWAP_ON:
+		mode_str = "on";
+		break;
+	default:
+		mode_str = "auto";
+		break;
+	}
+
+	return sysfs_emit(buf, "%s (active: %d)\n", mode_str, hd->swap_axes);
+}
+
+static ssize_t swap_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct hori_device *hd = hid_get_drvdata(to_hid_device(dev));
+
+	if (sysfs_streq(buf, "auto") || sysfs_streq(buf, "0")) {
+		hd->swap_mode = HORI_SWAP_AUTO;
+	} else if (sysfs_streq(buf, "off") || sysfs_streq(buf, "1")) {
+		hd->swap_mode = HORI_SWAP_OFF;
+		hd->swap_axes = false;
+	} else if (sysfs_streq(buf, "on") || sysfs_streq(buf, "2")) {
+		hd->swap_mode = HORI_SWAP_ON;
+		hd->swap_axes = true;
+	} else {
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(swap);
+
 static struct attribute *hori_cfg_attrs[] = {
 	&hori_attr_range.attr.attr,
 	&hori_attr_wheel_deadzone.attr.attr,
@@ -1061,6 +1119,7 @@ static struct attribute *hori_cfg_attrs[] = {
 	&hori_attr_ffb_strength.attr.attr,
 	&hori_attr_ffb_vibration.attr.attr,
 	&hori_attr_stick_level.attr.attr,
+	&dev_attr_swap.attr,
 	NULL,
 };
 
@@ -1068,20 +1127,60 @@ static const struct attribute_group hori_cfg_group = {
 	.attrs = hori_cfg_attrs,
 };
 
+static bool hori_is_wine_or_proton(void)
+{
+    struct task_struct *task;
+    bool found = false;
+
+    rcu_read_lock();
+    for (task = current; task != &init_task && task != NULL; task = rcu_dereference(task->real_parent)) {
+        /* Prüft auf .exe (z.B. amtrucks.exe / eurotrucks2.exe) oder Wine/Proton-Wrapper */
+        if (strstr(task->comm, ".exe") != NULL ||
+            strstr(task->comm, "wine") != NULL ||
+            strstr(task->comm, "proton") != NULL ||
+            strstr(task->comm, "pressure-vessel") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    rcu_read_unlock();
+
+    return found;
+}
+
+static int hori_input_open(struct input_dev *dev)
+{
+	struct hori_device *hd = hori_from_input(dev);
+
+	if (hd->swap_mode == HORI_SWAP_AUTO) {
+		hd->swap_axes = hori_is_wine_or_proton();
+		hid_info(hd->hdev, "opened by '%s' -> auto swap Native to Wine/Proton: %s\n",
+			 current->comm, hd->swap_axes ? "yes" : "no");
+	}
+
+	if (hd->orig_open)
+		return hd->orig_open(dev);
+
+	return 0;
+}
 
 static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
-{
+{	
 	u8 hat = data[1] & 0x0f;
-
-	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[9]));
+	/*
+	* Wheel is inn Linux on WHEEL, mini sticks on Y/X and Rx/Ry, clutch on Rz, 
+	* Throttle  on THROTTLE  annd  breaks onn BREAK axes.
+	*  for Linux we use the WHEEL axis, because the ff works on it, too 
+	* and ETS2/ATS has in the Linux native Version the Mouse courser on X axis.
+	*/
+	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[13]));
 	input_report_abs(input_dev, ABS_Y, get_unaligned_le16(&data[11]));
-	input_report_abs(input_dev, ABS_Z, get_unaligned_le16(&data[13]));
+	input_report_abs(input_dev, ABS_Z, get_unaligned_le16(&data[9]));
 	input_report_abs(input_dev, ABS_RX, get_unaligned_le16(&data[15]));
 	input_report_abs(input_dev, ABS_RY, get_unaligned_le16(&data[17]));
 	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
 	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
 	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
-
 	/*
 	 * The hat is the low nibble of byte 1: 0..7 = up, up-right, ...,
 	 * up-left; anything else (null state) = centred. hat_to_axis row 0
@@ -1091,7 +1190,40 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][0]);
 	input_report_abs(input_dev, ABS_HAT0Y, hat_to_axis[hat][1]);
 
-	input_report_abs(input_dev, ABS_MISC, data[26] << 8);
+	input_report_abs(input_dev, ABS_MISC, get_unaligned_le16(&data[28]));
+}
+
+static void parse_tcs_wine_axis_report(struct input_dev *input_dev, u8 *data)
+{
+	u8 hat = data[1] & 0x0f;
+	/*
+	 * The axis codes are picked so that ascending code order matches the
+	 * device's own HID descriptor (and HORI's Windows layout): wheel on
+	 * X, mini sticks on Y/Z and Rx/Ry, clutch on Rz and the pedals on
+	 * the slider axes.  Wine's SDL bus assigns HID usages in code order,
+	 * so Proton games see the same axes as on Windows: the clutch lands
+	 * on Rz instead of "right stick Y" (whose resting value of 0 reads
+	 * as a held stick and auto-scrolls menus), and the wheel lands on X
+	 * where games expect it for force feedback.
+	 */
+	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[9]));
+	input_report_abs(input_dev, ABS_Y, get_unaligned_le16(&data[11]));
+	input_report_abs(input_dev, ABS_Z, get_unaligned_le16(&data[13]));
+	input_report_abs(input_dev, ABS_RX, get_unaligned_le16(&data[15]));
+	input_report_abs(input_dev, ABS_RY, get_unaligned_le16(&data[17]));
+	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
+	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
+	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
+	/*
+	 * The hat is the low nibble of byte 1: 0..7 = up, up-right, ...,
+	 * up-left; anything else (null state) = centred. hat_to_axis row 0
+	 * is centred, so direction n is row n + 1.
+	 */
+	hat = hat < 8 ? hat + 1 : 0;
+	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][0]);
+	input_report_abs(input_dev, ABS_HAT0Y, hat_to_axis[hat][1]);
+
+	input_report_abs(input_dev, ABS_MISC, get_unaligned_le16(&data[28]));
 }
 
 static int hori_raw_event(struct hid_device *hdev,
@@ -1108,7 +1240,11 @@ static int hori_raw_event(struct hid_device *hdev,
 	if (report->id != 1 || !hd->input)
 		return 0;
 
-	parse_tcs_axis_report(hd->input, data);
+	if (hd->swap_axes) {
+	    parse_tcs_wine_axis_report(hd->input, data);
+	} else {
+	    parse_tcs_axis_report(hd->input, data);
+	}
 	input_sync(hd->input);
 
 	return 0;
@@ -1139,17 +1275,7 @@ static int hori_input_configured(struct hid_device *hdev,
 	set_bit(ABS_HAT0X, input_dev->absbit);
 	set_bit(ABS_HAT0Y, input_dev->absbit);
 	set_bit(ABS_MISC, input_dev->absbit);
-
-	/*
-	 * The axis codes are picked so that ascending code order matches the
-	 * device's own HID descriptor (and HORI's Windows layout): wheel on
-	 * X, mini sticks on Y/Z and Rx/Ry, clutch on Rz and the pedals on
-	 * the slider axes.  Wine's SDL bus assigns HID usages in code order,
-	 * so Proton games see the same axes as on Windows: the clutch lands
-	 * on Rz instead of "right stick Y" (whose resting value of 0 reads
-	 * as a held stick and auto-scrolls menus), and the wheel lands on X
-	 * where games expect it for force feedback.
-	 */
+	    
 	input_set_abs_params(input_dev, ABS_X, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_Y, 0, 65535, 0, 0);
 	input_set_abs_params(input_dev, ABS_Z, 0, 65535, 0, 0);
@@ -1165,6 +1291,9 @@ static int hori_input_configured(struct hid_device *hdev,
 	if (hori_ff_init(hd, input_dev))
 		hid_warn(hdev, "force feedback not available\n");
 
+	hd->orig_open = input_dev->open;
+	input_dev->open = hori_input_open;
+	
 	return 0;
 }
 
