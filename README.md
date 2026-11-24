@@ -21,6 +21,7 @@ W=$(ls -d /sys/bus/hid/drivers/hid-hori-control-systems/0003:0F0D:017A.*)
 cat $W/range
 echo 900 | sudo tee $W/range
 ```
+To change in Wine/Proton mode open a terminal and type:  `echo on > /sys/bus/hid/drivers/hid-hori-control-systems/*0F0D:017A*/swap`, to switch in native mode: `echo off > /sys/bus/hid/drivers/hid-hori-control-systems/*0F0D:017A*/swap` and automatic mode: `echo auto > /sys/bus/hid/drivers/hid-hori-control-systems/*0F0D:017A*/swap`.  
 
 Install the udev rules (`sudo make udev-rules`) to change them without root, e.g. from Oversteer.
 
