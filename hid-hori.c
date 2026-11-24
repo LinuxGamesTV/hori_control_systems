@@ -1167,7 +1167,6 @@ static int hori_input_open(struct input_dev *dev)
 static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {	
 	u8 hat = data[1] & 0x0f;
-
 	/*
 	* Wheel is inn Linux on WHEEL, mini sticks on Y/X and Rx/Ry, clutch on Rz, 
 	* Throttle  on THROTTLE  annd  breaks onn BREAK axes.
@@ -1176,13 +1175,12 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 	*/
 	input_report_abs(input_dev, ABS_X, get_unaligned_le16(&data[13]));
 	input_report_abs(input_dev, ABS_Y, get_unaligned_le16(&data[11]));
-	input_report_abs(input_dev, ABS_WHEEL, get_unaligned_le16(&data[9]));
+	input_report_abs(input_dev, ABS_Z, get_unaligned_le16(&data[9]));
 	input_report_abs(input_dev, ABS_RX, get_unaligned_le16(&data[15]));
 	input_report_abs(input_dev, ABS_RY, get_unaligned_le16(&data[17]));
 	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
 	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
 	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
-
 	/*
 	 * The hat is the low nibble of byte 1: 0..7 = up, up-right, ...,
 	 * up-left; anything else (null state) = centred. hat_to_axis row 0
@@ -1192,7 +1190,7 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][0]);
 	input_report_abs(input_dev, ABS_HAT0Y, hat_to_axis[hat][1]);
 
-	input_report_abs(input_dev, ABS_MISC, data[26] << 8);
+	input_report_abs(input_dev, ABS_MISC, get_unaligned_le16(&data[28]));
 }
 
 static void parse_tcs_wine_axis_report(struct input_dev *input_dev, u8 *data)
@@ -1216,7 +1214,6 @@ static void parse_tcs_wine_axis_report(struct input_dev *input_dev, u8 *data)
 	input_report_abs(input_dev, ABS_CLUTCH, get_unaligned_le16(&data[19]));
 	input_report_abs(input_dev, ABS_GAS, get_unaligned_le16(&data[21]));
 	input_report_abs(input_dev, ABS_BRAKE, get_unaligned_le16(&data[23]));
-
 	/*
 	 * The hat is the low nibble of byte 1: 0..7 = up, up-right, ...,
 	 * up-left; anything else (null state) = centred. hat_to_axis row 0
@@ -1226,7 +1223,7 @@ static void parse_tcs_wine_axis_report(struct input_dev *input_dev, u8 *data)
 	input_report_abs(input_dev, ABS_HAT0X, hat_to_axis[hat][0]);
 	input_report_abs(input_dev, ABS_HAT0Y, hat_to_axis[hat][1]);
 
-	input_report_abs(input_dev, ABS_MISC, data[26] << 8);
+	input_report_abs(input_dev, ABS_MISC, get_unaligned_le16(&data[28]));
 }
 
 static int hori_raw_event(struct hid_device *hdev,
@@ -1249,7 +1246,7 @@ static int hori_raw_event(struct hid_device *hdev,
 	    parse_tcs_axis_report(hd->input, data);
 	}
 	input_sync(hd->input);
-	    
+
 	return 0;
 }
 
@@ -1267,71 +1264,29 @@ static int hori_input_configured(struct hid_device *hdev,
 
 	set_bit(EV_ABS, input_dev->evbit);
 
-	if (hd->swap_axes) {
-	/*
-	 * The axis codes are picked so that ascending code order matches the
-	 * device's own HID descriptor (and HORI's Windows layout): wheel on
-	 * X, mini sticks on Y/Z and Rx/Ry, clutch on Rz and the pedals on
-	 * the slider axes.  Wine's SDL bus assigns HID usages in code order,
-	 * so Proton games see the same axes as on Windows: the clutch lands
-	 * on Rz instead of "right stick Y" (whose resting value of 0 reads
-	 * as a held stick and auto-scrolls menus), and the wheel lands on X
-	 * where games expect it for force feedback.
-	 */
-	    set_bit(ABS_X, input_dev->absbit);
-	    set_bit(ABS_Y, input_dev->absbit);
-	    set_bit(ABS_Z, input_dev->absbit);
-	    set_bit(ABS_RX, input_dev->absbit);
-	    set_bit(ABS_RY, input_dev->absbit);
-	    set_bit(ABS_CLUTCH, input_dev->absbit);
-	    set_bit(ABS_GAS, input_dev->absbit);
-	    set_bit(ABS_BRAKE, input_dev->absbit);
-	    set_bit(ABS_HAT0X, input_dev->absbit);
-	    set_bit(ABS_HAT0Y, input_dev->absbit);
-	    set_bit(ABS_MISC, input_dev->absbit);
+	set_bit(ABS_X, input_dev->absbit);
+	set_bit(ABS_Y, input_dev->absbit);
+	set_bit(ABS_Z, input_dev->absbit);
+	set_bit(ABS_RX, input_dev->absbit);
+	set_bit(ABS_RY, input_dev->absbit);
+	set_bit(ABS_CLUTCH, input_dev->absbit);
+	set_bit(ABS_GAS, input_dev->absbit);
+	set_bit(ABS_BRAKE, input_dev->absbit);
+	set_bit(ABS_HAT0X, input_dev->absbit);
+	set_bit(ABS_HAT0Y, input_dev->absbit);
+	set_bit(ABS_MISC, input_dev->absbit);
 	    
-	    input_set_abs_params(input_dev, ABS_X, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_Y, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_Z, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_RX, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_RY, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_GAS, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_BRAKE, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_HAT0X, -1, 1, 0, 0);
-	    input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
-	    input_set_abs_params(input_dev, ABS_MISC, 0, 255, 255, 0);
-	} else {
-	/*
-	 * Wheel is inn Linux on WHEEL, mini sticks on Y/X and Rx/Ry, clutch on Rz, 
-	 * Throttle  on THROTTLE  annd  breaks onn BREAK axes.
-	 *  for Linux we use the WHEEL axis, because the ff works on it, too 
-	 * and ETS2/ATS has in the Linux native Version the Mouse courser on X axis.
-	 */
-	    set_bit(ABS_X, input_dev->absbit);
-	    set_bit(ABS_Y, input_dev->absbit);
-	    set_bit(ABS_WHEEL, input_dev->absbit);
-	    set_bit(ABS_RX, input_dev->absbit);
-	    set_bit(ABS_RY, input_dev->absbit);
-	    set_bit(ABS_CLUTCH, input_dev->absbit);
-	    set_bit(ABS_GAS, input_dev->absbit);
-	    set_bit(ABS_BRAKE, input_dev->absbit);
-	    set_bit(ABS_HAT0X, input_dev->absbit);
-	    set_bit(ABS_HAT0Y, input_dev->absbit);
-	    set_bit(ABS_MISC, input_dev->absbit);
-	    
-	    input_set_abs_params(input_dev, ABS_X, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_Y, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_WHEEL, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_RX, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_RY, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_GAS, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_BRAKE, 0, 65535, 0, 0);
-	    input_set_abs_params(input_dev, ABS_HAT0X, -1, 1, 0, 0);
-	    input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
-	    input_set_abs_params(input_dev, ABS_MISC, 0, 255, 255, 0);
-	}
+	input_set_abs_params(input_dev, ABS_X, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_Y, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_Z, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_RX, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_RY, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_CLUTCH, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_GAS, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_BRAKE, 0, 65535, 0, 0);
+	input_set_abs_params(input_dev, ABS_HAT0X, -1, 1, 0, 0);
+	input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
+	input_set_abs_params(input_dev, ABS_MISC, 0, 255, 255, 0);
 
 	if (hori_ff_init(hd, input_dev))
 		hid_warn(hdev, "force feedback not available\n");
