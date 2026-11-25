@@ -60,3 +60,5 @@ sudo dkms install /usr/src/hid-hori
 ![Pedals_work](https://github.com/user-attachments/assets/7f347458-5c01-4d28-bd4c-e2b78a502ef2)
 
 [Installation](https://github.com/LinuxGamesTV/hori_control_systems/wiki)
+
+[Confuguration](https://github.com/LinuxGamesTV/hori_control_systems/wiki/Configuration)
