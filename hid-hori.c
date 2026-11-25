@@ -1168,8 +1168,8 @@ static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {	
 	u8 hat = data[1] & 0x0f;
 	/*
-	* Wheel is inn Linux on WHEEL, mini sticks on Y/X and Rx/Ry, clutch on Rz, 
-	* Throttle  on THROTTLE  annd  breaks onn BREAK axes.
+	* Wheel is on Z axis in Linux mode, mini sticks on Y/X and Rx/Ry, clutch on Rz, 
+	* Gas  on GAS  annd  breaks onn BREAK axes.
 	*  for Linux we use the WHEEL axis, because the ff works on it, too 
 	* and ETS2/ATS has in the Linux native Version the Mouse courser on X axis.
 	*/
