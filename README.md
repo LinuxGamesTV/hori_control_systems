@@ -61,4 +61,4 @@ sudo dkms install /usr/src/hid-hori
 
 [Installation](https://github.com/LinuxGamesTV/hori_control_systems/wiki)
 
-[Confuguration](https://github.com/LinuxGamesTV/hori_control_systems/wiki/Configuration)
+[Configuration](https://github.com/LinuxGamesTV/hori_control_systems/wiki/Configuration)
