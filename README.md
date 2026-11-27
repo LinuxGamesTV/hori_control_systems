@@ -25,13 +25,19 @@ To change in Wine/Proton mode open a terminal and type:  `echo on > /sys/bus/hid
 
 Install the udev rules (`sudo make udev-rules`) to change them without root, e.g. from Oversteer.
 
-Button 5 can be used as a left mouse button.  In Winne/Protonn you hhave  now a Virtual Mousse.
+Button 5 can be used as a left mouse button.  In Wine/Proton you hhave  now a Virtual Mousse.
 The steering wheel behaves the same as under Windows. The left analog stick can now be used as a mouse in native and via Wine/Proton.
 
 The shifter is fully working now, too.
 
 This kernel driver is in Beta now.
 
+
+## Known Bugs:
+
+* Mouse Button (BTN_TOP_2) don't works correctly in the native Linux ETS2/ATS Version on the in-game Maps (fast travel/world map).
+* You can't use the Euro Truck Simulator 2/American Truck Simulator auto configuration, because the autoconfig don't find the wheel and shifter.
+  
 ## Testing
 ```shell
 # Create a debug build
