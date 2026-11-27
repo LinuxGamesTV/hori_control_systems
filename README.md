@@ -1,4 +1,4 @@
-# This is a Experimental Linux Kernel driver (for kernels 6.12 or higher) for the Hori Truck Control System.
+# This is a Beta Linux Kernel driver (for kernels 6.12 or higher) for the Hori Force Feedack Truck Control System.
 
 All three pedals work now: Gas, brake and clutch.
 Force Feedback works now: the wheel's own effect engine is used, so all Linux force feedback effects are supported (constant, ramp, sine/square/triangle/sawtooth, spring, damper, inertia, friction), plus gain and autocenter. The protocol notes are in `hid-hori.c`. Games using SDL might need the environment variable `SDL_JOYSTICK_WHEEL_DEVICES=0x0f0d/0x017a` to recognize the wheel. If forces feel mirrored in a game, load the module with `invert_ff=1`.
@@ -25,13 +25,12 @@ To change in Wine/Proton mode open a terminal and type:  `echo on > /sys/bus/hid
 
 Install the udev rules (`sudo make udev-rules`) to change them without root, e.g. from Oversteer.
 
-Button 5 cannot be used as return or left mouse button, because the button is not mappable as left mouse button/return key.
-The steering wheel behaves the same as under Windows. The left analog stick can now be used as a mouse.
-The dead zones have also been resolved and the hatswitch is working as expected.
+Button 5 can be used as a left mouse button.  In Winne/Protonn you hhave  now a Virtual Mousse.
+The steering wheel behaves the same as under Windows. The left analog stick can now be used as a mouse in native and via Wine/Proton.
 
 The shifter is fully working now, too.
 
-This kernel driver is an early alpha.
+This kernel driver is in Beta now.
 
 ## Testing
 ```shell
