@@ -15,6 +15,7 @@
 #include <linux/fs.h>
 #include <linux/hid.h>
 #include <linux/input.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mm.h>
@@ -24,6 +25,7 @@
 #include <linux/string.h>
 #include <linux/timer.h>
 #include <linux/usb.h>
+#include <linux/version.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
@@ -43,6 +45,9 @@
 
 #define ABS_CLUTCH      ABS_RZ
 #define JOY_RANGE	(BTN_DEAD - BTN_JOYSTICK + 1)
+#define HORI_MOUSE_POLL_MS   8    /* ~125 Hz für flüssige Cursor-Bewegung */
+#define HORI_STICK_DEADZONE  15   /* Deadzone (bei 0..255 mit Mitte 128) */
+#define HORI_MOUSE_SPEED     12   /* Maximale Pixel pro Tick bei Vollausschlag */
 
 /*
  * Force feedback protocol
@@ -128,9 +133,15 @@ struct hori_ff_slot {
 struct hori_device {
 	struct hid_device *hdev;
 	struct input_dev *input;
+	struct input_dev *mouse_input;
+	struct timer_list mouse_timer;
+	int stick_x;
+	int stick_y;
+	bool prev_btn_top2;
+	
 	int (*orig_open)(struct input_dev *dev);
 	enum hori_swap_mode swap_mode;
-	bool swap_axes;
+	bool swap_axis;
 	struct hid_report *ffb_report;
 	spinlock_t lock;	/* ffb_report values, slots, flags below */
 	struct hori_ff_slot slot[HORI_FFB_SLOTS];
@@ -1084,7 +1095,7 @@ static ssize_t swap_show(struct device *dev, struct device_attribute *attr,
 		break;
 	}
 
-	return sysfs_emit(buf, "%s (active: %d)\n", mode_str, hd->swap_axes);
+	return sysfs_emit(buf, "%s (active: %d)\n", mode_str, hd->swap_axis);
 }
 
 static ssize_t swap_store(struct device *dev, struct device_attribute *attr,
@@ -1096,10 +1107,10 @@ static ssize_t swap_store(struct device *dev, struct device_attribute *attr,
 		hd->swap_mode = HORI_SWAP_AUTO;
 	} else if (sysfs_streq(buf, "off") || sysfs_streq(buf, "1")) {
 		hd->swap_mode = HORI_SWAP_OFF;
-		hd->swap_axes = false;
+		hd->swap_axis = false;
 	} else if (sysfs_streq(buf, "on") || sysfs_streq(buf, "2")) {
 		hd->swap_mode = HORI_SWAP_ON;
-		hd->swap_axes = true;
+		hd->swap_axis = true;
 	} else {
 		return -EINVAL;
 	}
@@ -1153,9 +1164,9 @@ static int hori_input_open(struct input_dev *dev)
 	struct hori_device *hd = hori_from_input(dev);
 
 	if (hd->swap_mode == HORI_SWAP_AUTO) {
-		hd->swap_axes = hori_is_wine_or_proton();
+		hd->swap_axis = hori_is_wine_or_proton();
 		hid_info(hd->hdev, "opened by '%s' -> auto swap Native to Wine/Proton: %s\n",
-			 current->comm, hd->swap_axes ? "yes" : "no");
+			 current->comm, hd->swap_axis ? "yes" : "no");
 	}
 
 	if (hd->orig_open)
@@ -1164,12 +1175,89 @@ static int hori_input_open(struct input_dev *dev)
 	return 0;
 }
 
+static int hori_scale_axis(int val)
+{
+	int abs_val = abs(val);
+	int sign = (val < 0) ? -1 : 1;
+
+	if (abs_val <= HORI_STICK_DEADZONE)
+	    return 0;
+
+	return sign * (((abs_val - HORI_STICK_DEADZONE) * HORI_MOUSE_SPEED) /
+		    (128 - HORI_STICK_DEADZONE));
+}
+
+static void hori_mouse_timer_cb(struct timer_list *t)
+{
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+	    /* Neue API ab Linux 6.16 */
+	    struct hori_device *hd = timer_container_of(hd, t, mouse_timer);
+	#else
+	    /* Alte API vor Linux 6.1 */
+	    struct hori_device *hd = from_timer(hd, t, mouse_timer);
+	#endif
+
+	int dx, dy;
+    
+	if (!hd->mouse_input)
+	    return;
+
+	dx = hori_scale_axis(hd->stick_x);
+	dy = hori_scale_axis(hd->stick_y);
+
+	if (dx != 0 || dy != 0) {
+	    input_report_rel(hd->mouse_input, REL_X, dx);
+	    input_report_rel(hd->mouse_input, REL_Y, dy);
+	    input_sync(hd->mouse_input);
+	} 
+
+	mod_timer(&hd->mouse_timer, jiffies + msecs_to_jiffies(HORI_MOUSE_POLL_MS));
+}
+
+static int hori_setup_mouse_input(struct hid_device *hdev, struct hori_device *hd)
+{
+	struct input_dev *mdev;
+	int ret;
+
+	mdev = devm_input_allocate_device(&hdev->dev);
+	if (!mdev)
+	    return -ENOMEM;
+
+	mdev->name = "HORI Truck Control System Virtual Mouse";
+	mdev->phys = hdev->phys;
+	mdev->uniq = hdev->uniq;
+	mdev->id.bustype = hdev->bus;
+	mdev->id.vendor  = hdev->vendor;
+	mdev->id.product = hdev->product;
+	mdev->id.version = hdev->version;
+	mdev->dev.parent = &hdev->dev;
+
+	input_set_capability(mdev, EV_KEY, BTN_LEFT);
+	input_set_capability(mdev, EV_KEY, BTN_RIGHT);
+	input_set_capability(mdev, EV_REL, REL_X);
+	input_set_capability(mdev, EV_REL, REL_Y);
+
+	__set_bit(INPUT_PROP_POINTER, mdev->propbit);
+    
+	ret = input_register_device(mdev);
+	if (ret)
+	    return ret;
+
+	hd->mouse_input = mdev;
+
+	/* Polling-Timer initialisieren und starten */
+	timer_setup(&hd->mouse_timer, hori_mouse_timer_cb, 0);
+	mod_timer(&hd->mouse_timer, jiffies + msecs_to_jiffies(HORI_MOUSE_POLL_MS));
+
+	return 0;
+}
+
 static void parse_tcs_axis_report(struct input_dev *input_dev, u8 *data)
 {	
 	u8 hat = data[1] & 0x0f;
 	/*
-	* Wheel is on Z axis in Linux mode, mini sticks on Y/X and Rx/Ry, clutch on Rz, 
-	* Gas  on GAS  annd  breaks onn BREAK axes.
+	* Wheel is in Linux on Z, mini sticks on Y/X and Rx/Ry, clutch on Rz, 
+	* gas  on GAS  annd  breaks onn BREAK axes.
 	*  for Linux we use the WHEEL axis, because the ff works on it, too 
 	* and ETS2/ATS has in the Linux native Version the Mouse courser on X axis.
 	*/
@@ -1234,17 +1322,28 @@ static int hori_raw_event(struct hid_device *hdev,
 	if (hdev->product != USB_DEVICE_ID_HORI_TRUCK_WHEEL)
 		return 0;
 
-	/* Several wheels report as this id when operating in emulation mode. */
-
 	/* Report 1 carries the wheel state, the 0x20 reports are FFB acks */
 	if (report->id != 1 || !hd->input)
 		return 0;
 
-	if (hd->swap_axes) {
+	if (hd->swap_axis) {
 	    parse_tcs_wine_axis_report(hd->input, data);
 	} else {
 	    parse_tcs_axis_report(hd->input, data);
 	}
+	
+	if (hd->mouse_input) {
+	    bool btn_top2 = test_bit(BTN_TOP2, hd->input->key);
+
+	    hd->stick_x = ((int)get_unaligned_le16(&data[13]) - 32768) >> 8;
+	    hd->stick_y = ((int)get_unaligned_le16(&data[11]) - 32768) >> 8;
+
+	    if (btn_top2 != hd->prev_btn_top2) {
+		input_report_key(hd->mouse_input, BTN_LEFT, btn_top2);
+		input_sync(hd->mouse_input);
+		hd->prev_btn_top2 = btn_top2;
+	    }
+	}	
 	input_sync(hd->input);
 
 	return 0;
@@ -1349,10 +1448,16 @@ static int hori_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		hd->cfg_out = devm_kzalloc(&hdev->dev, HORI_CFG_LEN, GFP_KERNEL);
 		hd->cfg_in = devm_kzalloc(&hdev->dev, HORI_CFG_LEN, GFP_KERNEL);
 		if (hd->cfg_out && hd->cfg_in &&
-		    !sysfs_create_group(&hdev->dev.kobj, &hori_cfg_group))
+		    !sysfs_create_group(&hdev->dev.kobj, &hori_cfg_group)) {
 			hd->has_cfg = true;
-		else
+		} else {
 			hid_warn(hdev, "wheel settings attributes not available\n");
+		}
+		
+		ret = hori_setup_mouse_input(hdev, hd);
+		if (ret) {
+			hid_err(hdev, "Failed to setup virtual mouse input: %d\n", ret);
+		}
 	}
 
 	return 0;
@@ -1362,6 +1467,16 @@ static void hori_remove(struct hid_device *hdev)
 {
 	struct hori_device *hd = hid_get_drvdata(hdev);
 
+	if (hd && hd->mouse_input) {
+	    #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+		/* Neue API ab Linux 6.15 */
+		timer_delete_sync(&hd->mouse_timer);
+	    #else
+		/* Alte API vor Linux 6.15 */
+		del_timer_sync(&hd->mouse_timer);
+	    #endif
+	}
+	
 	if (hd->has_cfg) {
 		sysfs_remove_group(&hdev->dev.kobj, &hori_cfg_group);
 		/* save a pending change now (fails harmlessly if unplugged) */
