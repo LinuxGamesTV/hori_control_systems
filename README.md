@@ -1,4 +1,4 @@
-# This is a Beta Linux Kernel driver (for kernels 6.12 or higher) for the Hori Force Feedack Truck Control System.
+# This is a Beta Linux Kernel driver (for kernels 6.12 or higher) for the Hori Force Feedback Truck Control System.
 
 All three pedals work now: Gas, brake and clutch.
 Force Feedback works now: the wheel's own effect engine is used, so all Linux force feedback effects are supported (constant, ramp, sine/square/triangle/sawtooth, spring, damper, inertia, friction), plus gain and autocenter. The protocol notes are in `hid-hori.c`. Games using SDL might need the environment variable `SDL_JOYSTICK_WHEEL_DEVICES=0x0f0d/0x017a` to recognize the wheel. If forces feel mirrored in a game, load the module with `invert_ff=1`.
